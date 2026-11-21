@@ -3,3 +3,7 @@ data/
 output/
 scratch/
 dev-answer/
+target/
+
+out/
+__pycache__/
