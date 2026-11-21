@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
+libc = "0.2"
 
 [profile.release]
 lto = "fat"
