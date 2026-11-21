@@ -12,4 +12,4 @@ COPY run.sh /app/run.sh
 RUN chmod +x /app/run.sh /app/shopping-sessions
 WORKDIR /app
 USER 1000:1000
-ENTRYPOINT ["/app/run.sh"]
+ENTRYPOINT ["/app/shopping-sessions"]
