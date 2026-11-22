@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrd};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrd};
 use std::sync::{Barrier, OnceLock};
 
 #[global_allocator]
@@ -17,8 +17,9 @@ const DEDUP_SHARDS: usize = 128;
 const PERSON_SHARDS: usize = 64;
 const MIN_CHUNK_SIZE: usize = 64 * 1024;
 const MAX_CHUNK_SIZE: usize = 2 * 1024 * 1024;
-/// Above 4 MiB of link CSV (~200k+ pairs), the link lookup table outgrows L3
-/// and Wave 2B's region-localized lookup pays off; below it, direct resolution wins.
+const INLINE_LINK_FILE_MAX: usize = 1024 * 1024;
+/// Above 4 MiB of link CSV (~200k+ pairs), enable Wave 2B's region-localized lookup;
+/// below it, resolve directly into PERSON_SHARDS during Wave 2.
 const REGION_BATCH_LINK_BYTES: usize = 4 * 1024 * 1024;
 
 // ============================================================================
@@ -43,12 +44,11 @@ impl MappedFile {
                 len: 0,
             };
         }
-        // If the final page already has >= 32 bytes of OS zero-padding past EOF,
-        // a single mmap is safe for 16-byte SIMD loads. Otherwise reserve one
-        // spare anonymous zero page past EOF so loads never fault.
-        let page = 4096usize;
-        let rem = len & (page - 1);
-        let ptr = if rem != 0 && rem <= page - 32 {
+        // pack64_inline_simd loads 16 bytes from any position inside the file.
+        // Whenever the final 4 KiB page already has >= 16 bytes of OS zero-padding
+        // past `len` (~99.6% of files), a single mmap suffices with no VMA split.
+        let rem = len & 4095;
+        let ptr = if rem != 0 && rem <= 4080 {
             unsafe {
                 libc::mmap(
                     std::ptr::null_mut(),
@@ -60,6 +60,7 @@ impl MappedFile {
                 )
             }
         } else {
+            let page = 4096usize;
             let total = len.div_ceil(page) * page + page;
             unsafe {
                 let base = libc::mmap(
@@ -82,9 +83,6 @@ impl MappedFile {
             }
         };
         assert!(ptr != libc::MAP_FAILED, "mmap failed");
-        unsafe {
-            libc::madvise(ptr, len, libc::MADV_SEQUENTIAL);
-        }
         Self {
             ptr: ptr as *const u8,
             len,
@@ -95,6 +93,18 @@ impl MappedFile {
     fn as_slice(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+}
+
+/// Allocates a zero-initialized `Vec<T>` via `alloc_zeroed` so large buffers
+/// receive OS demand-zeroed pages instead of an eager `memset` loop.
+fn zeroed_vec<T>(len: usize) -> Vec<T> {
+    if len == 0 {
+        return Vec::new();
+    }
+    let layout = std::alloc::Layout::array::<T>(len).unwrap();
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut T };
+    assert!(!ptr.is_null(), "alloc_zeroed failed");
+    unsafe { Vec::from_raw_parts(ptr, len, len) }
 }
 
 // ============================================================================
@@ -148,6 +158,9 @@ const DECODE_LUT: [u8; 64] = {
 #[inline(always)]
 fn pack64_try_inline(b: &[u8]) -> Option<u64> {
     let len = b.len();
+    if len == 0 {
+        return Some(0);
+    }
     if len > 10 {
         return None;
     }
@@ -285,15 +298,18 @@ fn overflow_bytes<'a>(v: u64, arenas: &'a [Vec<u8>]) -> &'a [u8] {
 }
 
 #[inline(always)]
-fn decode_inline(v: u64, out: &mut [u8; 10]) -> usize {
-    let mut len = 0;
-    while len < 10 {
-        let code = ((v >> (57 - len * 6)) & 63) as usize;
-        if code == 0 {
-            break;
+fn decode_inline(v: u64, out: &mut [u8]) -> usize {
+    if v == 0 {
+        return 0;
+    }
+    let len = 10 - ((v.trailing_zeros() - 3) / 6) as usize;
+    let mut i = 0;
+    while i < len {
+        let code = ((v >> (57 - i * 6)) & 63) as usize;
+        unsafe {
+            *out.get_unchecked_mut(i) = *DECODE_LUT.get_unchecked(code);
         }
-        out[len] = DECODE_LUT[code];
-        len += 1;
+        i += 1;
     }
     len
 }
@@ -417,7 +433,7 @@ fn hash_pack64(v: u64, arenas: &[Vec<u8>]) -> u64 {
 }
 
 // ============================================================================
-// L1-hot write-combining shard buffer (adaptive block sizing)
+// L1-hot write-combining shard buffer (non-temporal streaming stores)
 // ============================================================================
 
 #[derive(Clone, Copy)]
@@ -434,9 +450,6 @@ impl<T> std::ops::Deref for ShardSlice<T> {
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
-
-const MIN_BLOCK_BYTES: usize = 4 * 1024;
-const MAX_BLOCK_BYTES: usize = 64 * 1024;
 
 struct ShardWriter<T: Copy, const S: usize, const B: usize> {
     bufs: Box<[[T; B]; S]>,
@@ -455,10 +468,9 @@ impl<T: Copy, const S: usize, const B: usize> ShardWriter<T, S, B> {
     fn new(zero: T, est_per_shard: usize) -> Self {
         let sz = std::mem::size_of::<T>();
         assert!((B * sz) % 16 == 0);
-        let min_blk = ((MIN_BLOCK_BYTES / sz) / B).max(1) * B;
-        let max_blk = ((MAX_BLOCK_BYTES / sz) / B).max(1) * B;
-        let blk = (est_per_shard.div_ceil(B) * B).clamp(min_blk, max_blk);
-        let chunk = (est_per_shard * S).div_ceil(blk) * blk + S * blk;
+        let target_bytes = (est_per_shard * sz * 5 / 4).clamp(8 * 1024, 64 * 1024);
+        let blk = ((target_bytes / sz) / B).max(1) * B;
+        let chunk = (est_per_shard * S).div_ceil(blk) * blk + (S / 4).max(1) * blk;
         let mut w = Self {
             bufs: vec![[zero; B]; S]
                 .into_boxed_slice()
@@ -698,6 +710,9 @@ fn split_fields<'a, const N: usize, const F: usize>(
         i += 1;
     }
     if q != 0 {
+        if (q & 1) != 0 {
+            return None;
+        }
         let mut explained = 0u32;
         let mut i = 0usize;
         while i < F {
@@ -959,7 +974,7 @@ fn resolve_chunk(b: &[u8], s0: usize, e0: usize) -> &[u8] {
 }
 
 // ============================================================================
-// Fast DateCache (1-entry register hit + 64-entry L1 table) & Timestamp Parsing
+// Fast DateCache (1-entry register hit + 128-entry zero-collision L1 table)
 // ============================================================================
 
 #[inline(always)]
@@ -1033,9 +1048,9 @@ struct DateCache {
     last_hi: u64,
     last_lo: u16,
     last_sec: i64,
-    keys_hi: [u64; 64],
-    keys_lo: [u16; 64],
-    vals_sec: [i64; 64],
+    keys_hi: [u64; 128],
+    keys_lo: [u16; 128],
+    vals_sec: [i64; 128],
 }
 
 impl DateCache {
@@ -1044,9 +1059,9 @@ impl DateCache {
             last_hi: 0,
             last_lo: 0,
             last_sec: 0,
-            keys_hi: [0; 64],
-            keys_lo: [0; 64],
-            vals_sec: [0; 64],
+            keys_hi: [0; 128],
+            keys_lo: [0; 128],
+            vals_sec: [0; 128],
         }
     }
 
@@ -1062,7 +1077,10 @@ impl DateCache {
         let day_sec = if hi == self.last_hi && lo == self.last_lo {
             self.last_sec
         } else {
-            let slot = (((b[6] as usize) << 5) ^ ((b[8] as usize) << 4) ^ (b[9] as usize)) & 63;
+            let slot = ((((b[6] as usize) & 1) << 6)
+                | (((b[8] as usize) & 3) << 4)
+                | ((b[9] as usize) & 15))
+                & 127;
             if self.keys_hi[slot] == hi && self.keys_lo[slot] == lo {
                 let sec = self.vals_sec[slot];
                 self.last_hi = hi;
@@ -1439,7 +1457,7 @@ impl IdLookup {
     }
 
     #[inline(always)]
-    fn resolve_hashed(&self, p: u64, h: u64, person_arenas: &[Vec<u8>]) -> (u64, u64) {
+    fn resolve_inline(&self, p: u64, h: u64) -> (u64, u64) {
         if self.has_links && self.maybe_linked(h) {
             let mut pos = self.slot_of(h);
             loop {
@@ -1447,7 +1465,7 @@ impl IdLookup {
                 if e[0] == 0 {
                     break;
                 }
-                if e[1] == h && eq_pack64(e[0], p, person_arenas) {
+                if e[0] == p {
                     return (e[2], e[3]);
                 }
                 pos = (pos + 1) & self.mask;
@@ -1457,7 +1475,7 @@ impl IdLookup {
     }
 
     #[inline(always)]
-    fn resolve_hashed_inline(&self, p: u64, h: u64) -> (u64, u64) {
+    fn resolve_hashed(&self, p: u64, h: u64, person_arenas: &[Vec<u8>]) -> (u64, u64) {
         if self.has_links && self.maybe_linked(h) {
             let mut pos = self.slot_of(h);
             loop {
@@ -1465,7 +1483,7 @@ impl IdLookup {
                 if e[0] == 0 {
                     break;
                 }
-                if e[0] == p {
+                if e[1] == h && eq_pack64(e[0], p, person_arenas) {
                     return (e[2], e[3]);
                 }
                 pos = (pos + 1) & self.mask;
@@ -1810,102 +1828,6 @@ fn push_plain_str(out: &mut Vec<u8>, s: &[u8]) {
 // Core Pipeline Structs & Small-Slice Sorts
 // ============================================================================
 
-struct Dims {
-    categories: Vec<String>,
-    cat_rank: Vec<u8>,
-    prod_fast: Vec<u8>,
-    prod_fallback: BytesMap<u8>,
-    camp_names: Vec<String>,
-    camp_channels: Vec<String>,
-    camp_fast: Vec<u16>,
-    camp_fallback: BytesMap<u16>,
-}
-
-fn load_dims(data_dir: &Path, use_avx2: bool) -> Dims {
-    let mut categories: Vec<String> = vec!["unknown".to_owned()];
-    let mut cat_to_idx: BytesMap<u8> = BytesMap::with_capacity(64);
-    cat_to_idx.insert(b"unknown", 0);
-    let mut prod_fast: Vec<u8> = Vec::new();
-    let mut prod_fallback: BytesMap<u8> = BytesMap::with_capacity(64);
-    {
-        let mf = MappedFile::open(&data_dir.join("products.csv"));
-        let b = mf.as_slice();
-        let start = find_nl(b, 0);
-        scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
-            if cnt != 1 {
-                return;
-            }
-            let Some([p, cat]) = split_fields::<1, 2>(line, c, q) else {
-                return;
-            };
-            let idx = match cat_to_idx.get(cat) {
-                Some(i) => i,
-                None => {
-                    let i = categories.len() as u8;
-                    categories.push(std::str::from_utf8(cat).unwrap().to_owned());
-                    cat_to_idx.insert(cat, i);
-                    i
-                }
-            };
-            if let Some(pid) = parse_prefixed_uint(p, b"p") {
-                if pid >= prod_fast.len() {
-                    prod_fast.resize(pid + 1, 0);
-                }
-                prod_fast[pid] = idx;
-            } else {
-                prod_fallback.insert(p, idx);
-            }
-        });
-    }
-
-    let mut cat_order: Vec<usize> = (0..categories.len()).collect();
-    cat_order.sort_by(|&a, &b| categories[a].cmp(&categories[b]));
-    let mut cat_rank = vec![0u8; categories.len()];
-    for (rank, &cat_idx) in cat_order.iter().enumerate() {
-        cat_rank[cat_idx] = rank as u8;
-    }
-
-    let mut camp_names: Vec<String> = vec!["organic".to_owned()];
-    let mut camp_channels: Vec<String> = vec!["organic".to_owned()];
-    let mut camp_fast: Vec<u16> = Vec::new();
-    let mut camp_fallback: BytesMap<u16> = BytesMap::with_capacity(64);
-    {
-        let mf = MappedFile::open(&data_dir.join("campaigns.csv"));
-        let b = mf.as_slice();
-        let start = find_nl(b, 0);
-        scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
-            if cnt != 1 {
-                return;
-            }
-            let Some([cp, ch]) = split_fields::<1, 2>(line, c, q) else {
-                return;
-            };
-            let idx = camp_names.len() as u16;
-            camp_names.push(std::str::from_utf8(cp).unwrap().to_owned());
-            camp_channels.push(std::str::from_utf8(ch).unwrap().to_owned());
-            if let Some(cid) = parse_prefixed_uint(cp, b"c_") {
-                if cid >= camp_fast.len() {
-                    camp_fast.resize(cid + 1, 0);
-                }
-                camp_fast[cid] = idx;
-            } else {
-                camp_fallback.insert(cp, idx);
-            }
-        });
-    }
-
-    Dims {
-        categories,
-        cat_rank,
-        prod_fast,
-        prod_fallback,
-        camp_names,
-        camp_channels,
-        camp_fast,
-        camp_fallback,
-    }
-}
-
 #[derive(Clone, Copy)]
 struct RawEvent {
     eid: u64,
@@ -2000,6 +1922,42 @@ struct CampaignDayAgg {
     assisted_sessions: i32,
 }
 
+struct WorkerResult {
+    camp_flat: Vec<CampaignDayAgg>,
+    init_ns: u64,
+    group_ns: u64,
+    sess_ns: u64,
+    parquet_ns: u64,
+}
+
+struct ProdDims {
+    cat_plain_blobs: Vec<Vec<u8>>,
+    cat_rank: Vec<u8>,
+    prod_fast: Vec<u8>,
+    prod_fallback: BytesMap<u8>,
+}
+
+struct CampDims {
+    camp_names: Vec<String>,
+    camp_channels: Vec<String>,
+    camp_fast: Vec<u16>,
+    camp_fallback: BytesMap<u16>,
+}
+
+struct OpenMeta {
+    big_link_chunks: Vec<(usize, usize, usize)>,
+    event_chunks: Vec<(usize, usize, usize)>,
+    click_chunks: Vec<(usize, usize, usize)>,
+    use_region_batch: bool,
+    est_ev_dedup: usize,
+    est_ev_person: usize,
+    est_cl_person: usize,
+    est_cl_flat: usize,
+    est_uev: usize,
+    est_ucl: usize,
+    est_out_rows_per_worker: usize,
+}
+
 #[inline(always)]
 fn sort_packed_events(events: &mut [u64]) {
     let n = events.len();
@@ -2022,32 +1980,96 @@ fn sort_packed_events(events: &mut [u64]) {
 }
 
 #[inline(always)]
-fn sort_packed_clicks(clicks: &mut [ClickPacked], cid_arenas: &[Vec<u8>]) {
+fn sort_packed_clicks(clicks: &mut [ClickPacked], cid_arenas: &[Vec<u8>], all_cids_inline: bool) {
     let n = clicks.len();
     if n <= 1 {
         return;
     }
-    let cmp = |a: &ClickPacked, b: &ClickPacked| {
-        a.ts_off
-            .cmp(&b.ts_off)
-            .then_with(|| cmp_pack64(b.cid, a.cid, cid_arenas))
-    };
-    if n <= 16 {
-        for i in 1..n {
-            let x = unsafe { *clicks.get_unchecked(i) };
-            let mut j = i;
-            while j > 0 && cmp(unsafe { clicks.get_unchecked(j - 1) }, &x) == Ordering::Greater {
-                unsafe { *clicks.get_unchecked_mut(j) = *clicks.get_unchecked(j - 1) };
-                j -= 1;
+    if all_cids_inline {
+        let cmp = |a: &ClickPacked, b: &ClickPacked| {
+            a.ts_off.cmp(&b.ts_off).then_with(|| b.cid.cmp(&a.cid))
+        };
+        if n <= 16 {
+            for i in 1..n {
+                let x = unsafe { *clicks.get_unchecked(i) };
+                let mut j = i;
+                while j > 0 && cmp(unsafe { clicks.get_unchecked(j - 1) }, &x) == Ordering::Greater
+                {
+                    unsafe { *clicks.get_unchecked_mut(j) = *clicks.get_unchecked(j - 1) };
+                    j -= 1;
+                }
+                unsafe { *clicks.get_unchecked_mut(j) = x };
             }
-            unsafe { *clicks.get_unchecked_mut(j) = x };
+        } else {
+            clicks.sort_unstable_by(cmp);
         }
     } else {
-        clicks.sort_unstable_by(cmp);
+        let cmp = |a: &ClickPacked, b: &ClickPacked| {
+            a.ts_off
+                .cmp(&b.ts_off)
+                .then_with(|| cmp_pack64(b.cid, a.cid, cid_arenas))
+        };
+        if n <= 16 {
+            for i in 1..n {
+                let x = unsafe { *clicks.get_unchecked(i) };
+                let mut j = i;
+                while j > 0 && cmp(unsafe { clicks.get_unchecked(j - 1) }, &x) == Ordering::Greater
+                {
+                    unsafe { *clicks.get_unchecked_mut(j) = *clicks.get_unchecked(j - 1) };
+                    j -= 1;
+                }
+                unsafe { *clicks.get_unchecked_mut(j) = x };
+            }
+        } else {
+            clicks.sort_unstable_by(cmp);
+        }
     }
 }
 
-fn list_csv_dir(dir: &Path) -> Vec<PathBuf> {
+#[cold]
+#[inline(never)]
+fn grow_pid_tab_inline(pid_tab: &mut Vec<u32>, person_keys: &[u64], tag_mask: u32) -> usize {
+    let nc = pid_tab.len() * 2;
+    pid_tab.clear();
+    pid_tab.resize(nc, 0);
+    let mask = nc - 1;
+    for (i, &pk) in person_keys.iter().enumerate() {
+        let h = mix64(pk);
+        let tag = ((h >> 26) as u32) & tag_mask;
+        let mut p = (h as usize) & mask;
+        while pid_tab[p] != 0 {
+            p = (p + 1) & mask;
+        }
+        pid_tab[p] = tag | ((i as u32) + 1);
+    }
+    mask
+}
+
+#[cold]
+#[inline(never)]
+fn grow_pid_tab_general(
+    pid_tab: &mut Vec<u32>,
+    person_keys: &[u64],
+    person_arenas: &[Vec<u8>],
+    tag_mask: u32,
+) -> usize {
+    let nc = pid_tab.len() * 2;
+    pid_tab.clear();
+    pid_tab.resize(nc, 0);
+    let mask = nc - 1;
+    for (i, &pk) in person_keys.iter().enumerate() {
+        let h = hash_pack64(pk, person_arenas);
+        let tag = ((h >> 26) as u32) & tag_mask;
+        let mut p = (h as usize) & mask;
+        while pid_tab[p] != 0 {
+            p = (p + 1) & mask;
+        }
+        pid_tab[p] = tag | ((i as u32) + 1);
+    }
+    mask
+}
+
+fn list_csv_paths(dir: &Path) -> Vec<PathBuf> {
     let mut paths: Vec<PathBuf> = fs::read_dir(dir)
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -2057,27 +2079,160 @@ fn list_csv_dir(dir: &Path) -> Vec<PathBuf> {
     paths
 }
 
+/// Splits each file into equal-sized slices for balanced work stealing
+/// across workers without oversized merged tail chunks.
 fn build_chunks_from_cells(
     files: &[SyncCell<MappedFile>],
     total_bytes: usize,
     ncpu: usize,
-    only_bigger_than: usize,
 ) -> Vec<(usize, usize, usize)> {
-    let chunk_size = (total_bytes / (ncpu * 4).max(1)).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+    let target = (total_bytes / (ncpu * 6).max(1)).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
     let mut chunks = Vec::new();
     for (fi, cell) in files.iter().enumerate() {
-        let len = unsafe { cell.get() }.len;
-        if len == 0 || len <= only_bigger_than {
+        let len = unsafe { cell.get().len };
+        if len == 0 {
             continue;
         }
+        let n_parts = len.div_ceil(target).max(1);
+        let step = len.div_ceil(n_parts);
         let mut pos = 0usize;
         while pos < len {
-            let end = (pos + chunk_size).min(len);
+            let end = (pos + step).min(len);
             chunks.push((fi, pos, end));
             pos = end;
         }
     }
     chunks
+}
+
+fn build_big_link_chunks(
+    files: &[SyncCell<MappedFile>],
+    ncpu: usize,
+) -> Vec<(usize, usize, usize)> {
+    let big_bytes: usize = files
+        .iter()
+        .map(|c| unsafe { c.get().len })
+        .filter(|&l| l > INLINE_LINK_FILE_MAX)
+        .sum();
+    if big_bytes == 0 {
+        return Vec::new();
+    }
+    let target = (big_bytes / (ncpu * 6).max(1)).clamp(MIN_CHUNK_SIZE, MAX_CHUNK_SIZE);
+    let mut chunks = Vec::new();
+    for (fi, cell) in files.iter().enumerate() {
+        let len = unsafe { cell.get().len };
+        if len <= INLINE_LINK_FILE_MAX {
+            continue;
+        }
+        let n_parts = len.div_ceil(target).max(1);
+        let step = len.div_ceil(n_parts);
+        let mut pos = 0usize;
+        while pos < len {
+            let end = (pos + step).min(len);
+            chunks.push((fi, pos, end));
+            pos = end;
+        }
+    }
+    chunks
+}
+
+fn load_products(path: &Path, use_avx2: bool) -> ProdDims {
+    let mut categories: Vec<String> = vec!["unknown".to_owned()];
+    let mut cat_to_idx: BytesMap<u8> = BytesMap::with_capacity(64);
+    cat_to_idx.insert(b"unknown", 0);
+    let mut prod_fast: Vec<u8> = Vec::new();
+    let mut prod_fallback: BytesMap<u8> = BytesMap::with_capacity(64);
+
+    let mf = MappedFile::open(path);
+    let b = mf.as_slice();
+    let start = find_nl(b, 0);
+    scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
+        if cnt != 1 {
+            return;
+        }
+        let Some([p, cat]) = split_fields::<1, 2>(line, c, q) else {
+            return;
+        };
+        let idx = match cat_to_idx.get(cat) {
+            Some(i) => i,
+            None => {
+                let i = categories.len() as u8;
+                categories.push(std::str::from_utf8(cat).unwrap().to_owned());
+                cat_to_idx.insert(cat, i);
+                i
+            }
+        };
+        if let Some(pid) = parse_prefixed_uint(p, b"p") {
+            if pid >= prod_fast.len() {
+                prod_fast.resize(pid + 1, 0);
+            }
+            prod_fast[pid] = idx;
+        } else {
+            prod_fallback.insert(p, idx);
+        }
+    });
+
+    let mut cat_order: Vec<usize> = (0..categories.len()).collect();
+    cat_order.sort_by(|&a, &b| categories[a].cmp(&categories[b]));
+    let mut cat_rank = vec![0u8; categories.len()];
+    for (rank, &cat_idx) in cat_order.iter().enumerate() {
+        cat_rank[cat_idx] = rank as u8;
+    }
+
+    let cat_plain_blobs: Vec<Vec<u8>> = categories
+        .iter()
+        .map(|s| {
+            let b = s.as_bytes();
+            let mut blob = Vec::with_capacity(4 + b.len());
+            blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
+            blob.extend_from_slice(b);
+            blob
+        })
+        .collect();
+
+    ProdDims {
+        cat_plain_blobs,
+        cat_rank,
+        prod_fast,
+        prod_fallback,
+    }
+}
+
+fn load_campaigns(path: &Path, use_avx2: bool) -> CampDims {
+    let mut camp_names: Vec<String> = vec!["organic".to_owned()];
+    let mut camp_channels: Vec<String> = vec!["organic".to_owned()];
+    let mut camp_fast: Vec<u16> = Vec::new();
+    let mut camp_fallback: BytesMap<u16> = BytesMap::with_capacity(64);
+
+    let mf = MappedFile::open(path);
+    let b = mf.as_slice();
+    let start = find_nl(b, 0);
+    scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
+        if cnt != 1 {
+            return;
+        }
+        let Some([cp, ch]) = split_fields::<1, 2>(line, c, q) else {
+            return;
+        };
+        let idx = camp_names.len() as u16;
+        camp_names.push(std::str::from_utf8(cp).unwrap().to_owned());
+        camp_channels.push(std::str::from_utf8(ch).unwrap().to_owned());
+        if let Some(cid) = parse_prefixed_uint(cp, b"c_") {
+            if cid >= camp_fast.len() {
+                camp_fast.resize(cid + 1, 0);
+            }
+            camp_fast[cid] = idx;
+        } else {
+            camp_fallback.insert(cp, idx);
+        }
+    });
+
+    CampDims {
+        camp_names,
+        camp_channels,
+        camp_fast,
+        camp_fallback,
+    }
 }
 
 struct SyncCell<T>(std::cell::UnsafeCell<Option<T>>);
@@ -2135,27 +2290,26 @@ fn main() {
     let num_days = ((max_day as i64) - (min_day as i64) + 1) as usize;
     let win_start_rem = win_start.rem_euclid(MS_PER_DAY) as u64;
 
-    // Fast directory listings only; actual open/mmap + dims + links run in parallel in Wave 0.
-    let link_paths = list_csv_dir(&data_dir.join("links"));
-    let event_paths = list_csv_dir(&data_dir.join("events"));
-    let click_paths = list_csv_dir(&data_dir.join("clicks"));
+    let link_paths = list_csv_paths(&data_dir.join("links"));
+    let event_paths = list_csv_paths(&data_dir.join("events"));
+    let click_paths = list_csv_paths(&data_dir.join("clicks"));
 
-    let link_files_slots: Vec<SyncCell<MappedFile>> =
+    fs::create_dir_all(out_dir.join("user_daily")).unwrap();
+    fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
+
+    let link_files: Vec<SyncCell<MappedFile>> =
         (0..link_paths.len()).map(|_| SyncCell::new()).collect();
-    let event_files_slots: Vec<SyncCell<MappedFile>> =
+    let event_files: Vec<SyncCell<MappedFile>> =
         (0..event_paths.len()).map(|_| SyncCell::new()).collect();
-    let click_files_slots: Vec<SyncCell<MappedFile>> =
+    let click_files: Vec<SyncCell<MappedFile>> =
         (0..click_paths.len()).map(|_| SyncCell::new()).collect();
 
-    let total_link_bytes_at = AtomicUsize::new(0);
-    let total_event_bytes_at = AtomicUsize::new(0);
-    let total_click_bytes_at = AtomicUsize::new(0);
-    let has_big_links_at = AtomicBool::new(false);
-
-    let dims_cell: OnceLock<Dims> = OnceLock::new();
+    let prod_dims_cell: OnceLock<ProdDims> = OnceLock::new();
+    let camp_dims_cell: OnceLock<CampDims> = OnceLock::new();
+    let open_meta_cell: OnceLock<OpenMeta> = OnceLock::new();
 
     let barrier = Barrier::new(ncpu);
-    let next_file = AtomicUsize::new(0);
+    let next_open = AtomicUsize::new(0);
     let next_big_link = AtomicUsize::new(0);
     let next_ev_chunk = AtomicUsize::new(0);
     let next_cl_chunk = AtomicUsize::new(0);
@@ -2180,7 +2334,7 @@ fn main() {
     let person_arenas_cell: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
     let eid_arenas_cell: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
     let cid_arenas_cell: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
-    let all_person_inline_cell: OnceLock<bool> = OnceLock::new();
+    let inline_flags_cell: OnceLock<(bool, bool, bool)> = OnceLock::new();
 
     let ev_person_slots: Vec<SyncCell<Vec<Vec<ShardSlice<ValidEvent>>>>> =
         (0..ncpu).map(|_| SyncCell::new()).collect();
@@ -2193,220 +2347,128 @@ fn main() {
     let ucl_slots: Vec<SyncCell<Vec<Vec<ShardSlice<UClick>>>>> =
         (0..ncpu).map(|_| SyncCell::new()).collect();
     let flat_cl_slots: Vec<SyncCell<Vec<UClick>>> = (0..ncpu).map(|_| SyncCell::new()).collect();
+    let worker_res_slots: Vec<SyncCell<WorkerResult>> =
+        (0..ncpu).map(|_| SyncCell::new()).collect();
 
-    let w3_group_ns = AtomicU64::new(0);
-    let w3_sess_ns = AtomicU64::new(0);
-    let w3_write_ns = AtomicU64::new(0);
+    let n_links = link_paths.len();
+    let n_events = event_paths.len();
+    let total_files = n_links + n_events + click_paths.len();
 
-    let n_link = link_paths.len();
-    let n_ev = event_paths.len();
-    let total_files = n_link + n_ev + click_paths.len();
+    std::thread::scope(|s| {
+        for tid in 0..ncpu {
+            let data_dir = &data_dir;
+            let out_dir = &out_dir;
+            let link_paths = &link_paths;
+            let event_paths = &event_paths;
+            let click_paths = &click_paths;
+            let link_files = &link_files;
+            let event_files = &event_files;
+            let click_files = &click_files;
+            let prod_dims_cell = &prod_dims_cell;
+            let camp_dims_cell = &camp_dims_cell;
+            let open_meta_cell = &open_meta_cell;
+            let barrier = &barrier;
+            let next_open = &next_open;
+            let next_big_link = &next_big_link;
+            let next_ev_chunk = &next_ev_chunk;
+            let next_cl_chunk = &next_cl_chunk;
+            let next_dedup_ev = &next_dedup_ev;
+            let next_person_shard = &next_person_shard;
+            let next_region = &next_region;
+            let link_pairs_slots = &link_pairs_slots;
+            let link_arena_slots = &link_arena_slots;
+            let id_lookup_cell = &id_lookup_cell;
+            let link_arenas_cell = &link_arenas_cell;
+            let raw_ev_slots = &raw_ev_slots;
+            let eid_arena_slots = &eid_arena_slots;
+            let ev_parena_slots = &ev_parena_slots;
+            let cid_arena_slots = &cid_arena_slots;
+            let cl_parena_slots = &cl_parena_slots;
+            let person_arenas_cell = &person_arenas_cell;
+            let eid_arenas_cell = &eid_arenas_cell;
+            let cid_arenas_cell = &cid_arenas_cell;
+            let inline_flags_cell = &inline_flags_cell;
+            let ev_person_slots = &ev_person_slots;
+            let cl_person_slots = &cl_person_slots;
+            let shard_order_cell = &shard_order_cell;
+            let uev_slots = &uev_slots;
+            let ucl_slots = &ucl_slots;
+            let flat_cl_slots = &flat_cl_slots;
+            let worker_res_slots = &worker_res_slots;
 
-    // Single persistent worker pool — fused parallel setup + links + pipeline
-    let camp_results: Vec<Vec<CampaignDayAgg>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..ncpu)
-            .map(|tid| {
-                let barrier = &barrier;
-                let data_dir = &data_dir;
-                let out_dir = &out_dir;
-                let link_paths = &link_paths;
-                let event_paths = &event_paths;
-                let click_paths = &click_paths;
-                let link_files_slots = &link_files_slots;
-                let event_files_slots = &event_files_slots;
-                let click_files_slots = &click_files_slots;
-                let total_link_bytes_at = &total_link_bytes_at;
-                let total_event_bytes_at = &total_event_bytes_at;
-                let total_click_bytes_at = &total_click_bytes_at;
-                let has_big_links_at = &has_big_links_at;
-                let dims_cell = &dims_cell;
-                let next_file = &next_file;
-                let next_big_link = &next_big_link;
-                let next_ev_chunk = &next_ev_chunk;
-                let next_cl_chunk = &next_cl_chunk;
-                let next_dedup_ev = &next_dedup_ev;
-                let next_person_shard = &next_person_shard;
-                let next_region = &next_region;
-                let link_pairs_slots = &link_pairs_slots;
-                let link_arena_slots = &link_arena_slots;
-                let id_lookup_cell = &id_lookup_cell;
-                let link_arenas_cell = &link_arenas_cell;
-                let raw_ev_slots = &raw_ev_slots;
-                let eid_arena_slots = &eid_arena_slots;
-                let ev_parena_slots = &ev_parena_slots;
-                let cid_arena_slots = &cid_arena_slots;
-                let cl_parena_slots = &cl_parena_slots;
-                let person_arenas_cell = &person_arenas_cell;
-                let eid_arenas_cell = &eid_arenas_cell;
-                let cid_arenas_cell = &cid_arenas_cell;
-                let all_person_inline_cell = &all_person_inline_cell;
-                let ev_person_slots = &ev_person_slots;
-                let cl_person_slots = &cl_person_slots;
-                let shard_order_cell = &shard_order_cell;
-                let uev_slots = &uev_slots;
-                let ucl_slots = &ucl_slots;
-                let flat_cl_slots = &flat_cl_slots;
-                let w3_group_ns = &w3_group_ns;
-                let w3_sess_ns = &w3_sess_ns;
-                let w3_write_ns = &w3_write_ns;
-
-                s.spawn(move || {
-                    // ---- WAVE 0: Parallel dims + mmap all CSVs + parse small link files ----
-                    if tid == 0 {
-                        fs::create_dir_all(out_dir.join("user_daily")).unwrap();
-                        fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
-                        let _ = dims_cell.set(load_dims(data_dir, use_avx2));
+            s.spawn(move || {
+                // ---- WAVE 0: Parallel single-mmap + dim load + inline small-link parse ----
+                if tid == 0 {
+                    let _ = prod_dims_cell
+                        .set(load_products(&data_dir.join("products.csv"), use_avx2));
+                    if ncpu == 1 {
+                        let _ = camp_dims_cell
+                            .set(load_campaigns(&data_dir.join("campaigns.csv"), use_avx2));
                     }
+                } else if tid == 1 {
+                    let _ = camp_dims_cell
+                        .set(load_campaigns(&data_dir.join("campaigns.csv"), use_avx2));
+                }
 
-                    let mut l_pairs: Vec<(u64, u64)> = Vec::new();
-                    let mut l_arena: Vec<u8> = Vec::new();
+                let mut l_pairs: Vec<(u64, u64)> = Vec::new();
+                let mut l_arena: Vec<u8> = Vec::new();
+                let aid = tid as u8;
 
-                    loop {
-                        let idx = next_file.fetch_add(1, AtomicOrd::Relaxed);
-                        if idx >= total_files {
-                            break;
-                        }
-                        if idx < n_link {
-                            let mf = MappedFile::open(&link_paths[idx]);
-                            total_link_bytes_at.fetch_add(mf.len, AtomicOrd::Relaxed);
-                            if mf.len > MAX_CHUNK_SIZE {
-                                has_big_links_at.store(true, AtomicOrd::Relaxed);
-                            } else if mf.len > 0 {
-                                let b = mf.as_slice();
-                                let start = find_nl(b, 0);
-                                if start < b.len() {
-                                    scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
-                                        if cnt != 1 {
-                                            return;
-                                        }
-                                        let Some([a, b]) = split_fields::<1, 2>(line, c, q) else {
-                                            return;
-                                        };
-                                        if a.is_empty() || b.is_empty() {
-                                            return;
-                                        }
-                                        let pa = pack64(a, tid as u8, &mut l_arena);
-                                        let pb = pack64(b, tid as u8, &mut l_arena);
-                                        l_pairs.push((pa, pb));
-                                    });
-                                }
+                loop {
+                    let fi = next_open.fetch_add(1, AtomicOrd::Relaxed);
+                    if fi >= total_files {
+                        break;
+                    }
+                    if fi < n_links {
+                        let mf = MappedFile::open(&link_paths[fi]);
+                        if mf.len > 0 && mf.len <= INLINE_LINK_FILE_MAX {
+                            let b = mf.as_slice();
+                            let start = find_nl(b, 0);
+                            if start < b.len() {
+                                scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
+                                    if cnt != 1 {
+                                        return;
+                                    }
+                                    let Some([a, b]) = split_fields::<1, 2>(line, c, q) else {
+                                        return;
+                                    };
+                                    if a.is_empty() || b.is_empty() {
+                                        return;
+                                    }
+                                    let pa = pack64(a, aid, &mut l_arena);
+                                    let pb = pack64(b, aid, &mut l_arena);
+                                    l_pairs.push((pa, pb));
+                                });
                             }
-                            unsafe { link_files_slots[idx].set(mf) };
-                        } else if idx < n_link + n_ev {
-                            let ei = idx - n_link;
-                            let mf = MappedFile::open(&event_paths[ei]);
-                            total_event_bytes_at.fetch_add(mf.len, AtomicOrd::Relaxed);
-                            unsafe { event_files_slots[ei].set(mf) };
-                        } else {
-                            let ci = idx - n_link - n_ev;
-                            let mf = MappedFile::open(&click_paths[ci]);
-                            total_click_bytes_at.fetch_add(mf.len, AtomicOrd::Relaxed);
-                            unsafe { click_files_slots[ci].set(mf) };
                         }
+                        unsafe { link_files[fi].set(mf) };
+                    } else if fi < n_links + n_events {
+                        let i = fi - n_links;
+                        unsafe { event_files[i].set(MappedFile::open(&event_paths[i])) };
+                    } else {
+                        let i = fi - n_links - n_events;
+                        unsafe { click_files[i].set(MappedFile::open(&click_paths[i])) };
                     }
+                }
+                barrier.wait();
 
-                    unsafe {
-                        link_pairs_slots[tid].set(l_pairs);
-                        link_arena_slots[tid].set(l_arena);
-                    }
-                    barrier.wait();
+                if tid == 0 {
+                    let total_link_bytes: usize =
+                        link_files.iter().map(|c| unsafe { c.get().len }).sum();
+                    let total_event_bytes: usize =
+                        event_files.iter().map(|c| unsafe { c.get().len }).sum();
+                    let total_click_bytes: usize =
+                        click_files.iter().map(|c| unsafe { c.get().len }).sum();
 
-                    // Rare path: any individual link file > 2 MiB is chunk-parsed in parallel.
-                    if has_big_links_at.load(AtomicOrd::Relaxed) {
-                        let total_link_bytes = total_link_bytes_at.load(AtomicOrd::Relaxed);
-                        let big_chunks = build_chunks_from_cells(
-                            link_files_slots,
-                            total_link_bytes,
-                            ncpu,
-                            MAX_CHUNK_SIZE,
-                        );
-                        let mut l_pairs = unsafe { link_pairs_slots[tid].take() };
-                        let mut l_arena = unsafe { link_arena_slots[tid].take() };
-                        loop {
-                            let ci = next_big_link.fetch_add(1, AtomicOrd::Relaxed);
-                            if ci >= big_chunks.len() {
-                                break;
-                            }
-                            let (fi, s0, e0) = big_chunks[ci];
-                            let slice =
-                                resolve_chunk(unsafe { link_files_slots[fi].get() }.as_slice(), s0, e0);
-                            if slice.is_empty() {
-                                continue;
-                            }
-                            scan_slice::<1, _>(slice, use_avx2, |line, c, cnt, q| {
-                                if cnt != 1 {
-                                    return;
-                                }
-                                let Some([a, b]) = split_fields::<1, 2>(line, c, q) else {
-                                    return;
-                                };
-                                if a.is_empty() || b.is_empty() {
-                                    return;
-                                }
-                                let pa = pack64(a, tid as u8, &mut l_arena);
-                                let pb = pack64(b, tid as u8, &mut l_arena);
-                                l_pairs.push((pa, pb));
-                            });
-                        }
-                        unsafe {
-                            link_pairs_slots[tid].set(l_pairs);
-                            link_arena_slots[tid].set(l_arena);
-                        }
-                        barrier.wait();
-                    }
-
-                    let total_link_bytes = total_link_bytes_at.load(AtomicOrd::Relaxed);
-                    let total_event_bytes = total_event_bytes_at.load(AtomicOrd::Relaxed);
-                    let total_click_bytes = total_click_bytes_at.load(AtomicOrd::Relaxed);
                     let use_region_batch = total_link_bytes > REGION_BATCH_LINK_BYTES;
-
-                    if trace && tid == 0 {
-                        eprintln!(
-                            "[{:7.3} s] wave 0 done (dims + mmap + links, region_batch={}, ncpu={})",
-                            t_start.elapsed().as_secs_f64(),
-                            use_region_batch,
-                            ncpu
-                        );
-                    }
-
-                    // ---- WAVE 1B: Thread 0 builds DSU while ALL threads parse events & clicks ----
-                    if tid == 0 {
-                        let mut all_pairs = Vec::with_capacity(ncpu);
-                        let mut l_arenas = Vec::with_capacity(ncpu);
-                        for t in 0..ncpu {
-                            all_pairs.push(unsafe { link_pairs_slots[t].take() });
-                            l_arenas.push(unsafe { link_arena_slots[t].take() });
-                        }
-                        let lookup = IdLookup::from_pairs(&all_pairs, &l_arenas);
-                        if trace {
-                            eprintln!(
-                                "[{:7.3} s] union-find built on worker 0",
-                                t_start.elapsed().as_secs_f64()
-                            );
-                        }
-                        std::mem::forget(all_pairs);
-                        unsafe { link_arenas_cell.set(l_arenas) };
-                        let _ = id_lookup_cell.set(lookup);
-                    }
-
-                    let dims = dims_cell.get().unwrap();
-                    let prod_fast = &dims.prod_fast;
-                    let prod_fallback = &dims.prod_fallback;
-                    let camp_fast = &dims.camp_fast;
-                    let camp_fallback = &dims.camp_fallback;
-                    let categories = &dims.categories;
-                    let cat_rank = &dims.cat_rank;
-                    let num_campaigns = dims.camp_names.len();
-                    let num_categories = categories.len();
-                    let flat_camp_len = num_days * num_campaigns;
-
+                    let big_link_chunks = build_big_link_chunks(link_files, ncpu);
                     let event_chunks =
-                        build_chunks_from_cells(event_files_slots, total_event_bytes, ncpu, 0);
+                        build_chunks_from_cells(event_files, total_event_bytes, ncpu);
                     let click_chunks =
-                        build_chunks_from_cells(click_files_slots, total_click_bytes, ncpu, 0);
+                        build_chunks_from_cells(click_files, total_click_bytes, ncpu);
 
                     let est_ev_dedup =
-                        ((total_event_bytes / 80) / (ncpu * DEDUP_SHARDS) * 115 / 100).max(64);
+                        ((total_event_bytes / 80) / (ncpu * DEDUP_SHARDS) * 115 / 100).max(32);
                     let est_ev_person =
                         ((total_event_bytes / 84) / (ncpu * PERSON_SHARDS) * 115 / 100).max(64);
                     let est_cl_person =
@@ -2419,87 +2481,188 @@ fn main() {
                     let est_out_rows_per_worker =
                         ((total_event_bytes / 600) / ncpu).clamp(1024, 262_144);
 
-                    let mut ev_writer =
-                        ShardWriter::<RawEvent, DEDUP_SHARDS, 4>::new(ZERO_RAW_EVENT, est_ev_dedup);
-                    let mut eid_arena: Vec<u8> = Vec::new();
-                    let mut ev_parena: Vec<u8> = Vec::new();
-                    let mut dc = DateCache::new();
-                    let e_aid = tid as u8;
-                    let ep_aid = (ncpu + tid) as u8;
+                    let _ = open_meta_cell.set(OpenMeta {
+                        big_link_chunks,
+                        event_chunks,
+                        click_chunks,
+                        use_region_batch,
+                        est_ev_dedup,
+                        est_ev_person,
+                        est_cl_person,
+                        est_cl_flat,
+                        est_uev,
+                        est_ucl,
+                        est_out_rows_per_worker,
+                    });
+                }
 
+                unsafe {
+                    link_pairs_slots[tid].set(l_pairs);
+                    link_arena_slots[tid].set(l_arena);
+                }
+                barrier.wait();
+
+                let meta = open_meta_cell.get().unwrap();
+                if !meta.big_link_chunks.is_empty() {
+                    let mut l_pairs = unsafe { link_pairs_slots[tid].take() };
+                    let mut l_arena = unsafe { link_arena_slots[tid].take() };
                     loop {
-                        let ci = next_ev_chunk.fetch_add(1, AtomicOrd::Relaxed);
-                        if ci >= event_chunks.len() {
+                        let ci = next_big_link.fetch_add(1, AtomicOrd::Relaxed);
+                        if ci >= meta.big_link_chunks.len() {
                             break;
                         }
-                        let (fi, s0, e0) = event_chunks[ci];
+                        let (fi, s0, e0) = meta.big_link_chunks[ci];
                         let slice =
-                            resolve_chunk(unsafe { event_files_slots[fi].get() }.as_slice(), s0, e0);
+                            resolve_chunk(unsafe { link_files[fi].get().as_slice() }, s0, e0);
                         if slice.is_empty() {
                             continue;
                         }
-                        scan_slice::<6, _>(slice, use_avx2, |line, c, cnt, q| {
-                            if cnt != 6 {
+                        scan_slice::<1, _>(slice, use_avx2, |line, c, cnt, q| {
+                            if cnt != 1 {
                                 return;
                             }
-                            let Some([f1, f2, f3, f4, f5, f6, f7]) =
-                                split_fields::<6, 7>(line, c, q)
-                            else {
+                            let Some([a, b]) = split_fields::<1, 2>(line, c, q) else {
                                 return;
                             };
-
-                            if f1.is_empty() {
+                            if a.is_empty() || b.is_empty() {
                                 return;
                             }
-                            let Some((ingest_ts, ingest_s)) = dc.parse_ingest_ts(f4) else {
-                                return;
-                            };
-                            let (eid, eid_h) = match pack64_try_inline(f1) {
-                                Some(p) => (p, mix64(p)),
-                                None => (pack64_overflow(f1, e_aid, &mut eid_arena), hash_bytes(f1)),
-                            };
+                            let pa = pack64(a, aid, &mut l_arena);
+                            let pb = pack64(b, aid, &mut l_arena);
+                            l_pairs.push((pa, pb));
+                        });
+                    }
+                    unsafe {
+                        link_pairs_slots[tid].set(l_pairs);
+                        link_arena_slots[tid].set(l_arena);
+                    }
+                    barrier.wait();
+                }
 
-                            let mut ts_off = u32::MAX;
-                            let mut raw_uid = 0u64;
-                            let mut price_cat = 0u32;
+                let prod_dims = prod_dims_cell.get().unwrap();
+                let camp_dims = camp_dims_cell.get().unwrap();
+                let prod_fast = &prod_dims.prod_fast;
+                let prod_fallback = &prod_dims.prod_fallback;
+                let cat_plain_blobs = &prod_dims.cat_plain_blobs;
+                let cat_rank = &prod_dims.cat_rank;
+                let camp_fast = &camp_dims.camp_fast;
+                let camp_fallback = &camp_dims.camp_fallback;
+                let num_campaigns = camp_dims.camp_names.len();
+                let num_categories = cat_plain_blobs.len();
+                let flat_camp_len = num_days * num_campaigns;
 
-                            if !f2.is_empty() && !f6.is_empty() {
-                                let is_p = match f5.len() {
-                                    4 => {
-                                        let w = u32::from_le_bytes(unsafe {
-                                            *(f5.as_ptr() as *const [u8; 4])
-                                        });
-                                        if w == u32::from_le_bytes(*b"view")
-                                            || w == u32::from_le_bytes(*b"cart")
-                                        {
-                                            Some(false)
-                                        } else {
-                                            None
-                                        }
+                if trace && tid == 0 {
+                    eprintln!(
+                        "[{:7.3} s] wave 0 done (dims + mmap + links, region_batch={}, ncpu={})",
+                        t_start.elapsed().as_secs_f64(),
+                        meta.use_region_batch,
+                        ncpu
+                    );
+                }
+
+                // ---- WAVE 1: Worker 0 builds DSU while all workers parse events & clicks ----
+                if tid == 0 {
+                    let mut all_pairs = Vec::with_capacity(ncpu);
+                    let mut l_arenas = Vec::with_capacity(ncpu);
+                    for t in 0..ncpu {
+                        all_pairs.push(unsafe { link_pairs_slots[t].take() });
+                        l_arenas.push(unsafe { link_arena_slots[t].take() });
+                    }
+                    let lookup = IdLookup::from_pairs(&all_pairs, &l_arenas);
+                    if trace {
+                        eprintln!(
+                            "[{:7.3} s] union-find built on worker 0",
+                            t_start.elapsed().as_secs_f64()
+                        );
+                    }
+                    std::mem::forget(all_pairs);
+                    unsafe { link_arenas_cell.set(l_arenas) };
+                    let _ = id_lookup_cell.set(lookup);
+                }
+
+                // 128 dedup shards * 4 * 32B = 16 KiB staging buf (L1d-resident)
+                let mut ev_writer = ShardWriter::<RawEvent, DEDUP_SHARDS, 4>::new(
+                    ZERO_RAW_EVENT,
+                    meta.est_ev_dedup,
+                );
+                let mut eid_arena = Vec::new();
+                let mut ev_parena = Vec::new();
+                let mut dc = DateCache::new();
+                let e_aid = tid as u8;
+                let ep_aid = (ncpu + tid) as u8;
+
+                loop {
+                    let ci = next_ev_chunk.fetch_add(1, AtomicOrd::Relaxed);
+                    if ci >= meta.event_chunks.len() {
+                        break;
+                    }
+                    let (fi, s0, e0) = meta.event_chunks[ci];
+                    let slice =
+                        resolve_chunk(unsafe { event_files[fi].get().as_slice() }, s0, e0);
+                    if slice.is_empty() {
+                        continue;
+                    }
+                    scan_slice::<6, _>(slice, use_avx2, |line, c, cnt, q| {
+                        if cnt != 6 {
+                            return;
+                        }
+                        let Some([f1, f2, f3, f4, f5, f6, f7]) = split_fields::<6, 7>(line, c, q)
+                        else {
+                            return;
+                        };
+
+                        if f1.is_empty() {
+                            return;
+                        }
+                        let Some((ingest_ts, ingest_s)) = dc.parse_ingest_ts(f4) else {
+                            return;
+                        };
+                        let (eid, eid_h) = match pack64_try_inline(f1) {
+                            Some(p) => (p, mix64(p)),
+                            None => (pack64_overflow(f1, e_aid, &mut eid_arena), hash_bytes(f1)),
+                        };
+
+                        let mut ts_off = u32::MAX;
+                        let mut raw_uid = 0u64;
+                        let mut price_cat = 0u32;
+
+                        if !f2.is_empty() && !f6.is_empty() {
+                            let is_p = match f5.len() {
+                                4 => {
+                                    let w = u32::from_le_bytes(unsafe {
+                                        *(f5.as_ptr() as *const [u8; 4])
+                                    });
+                                    if w == u32::from_le_bytes(*b"view")
+                                        || w == u32::from_le_bytes(*b"cart")
+                                    {
+                                        Some(false)
+                                    } else {
+                                        None
                                     }
-                                    8 => {
-                                        let w = u64::from_le_bytes(unsafe {
-                                            *(f5.as_ptr() as *const [u8; 8])
-                                        });
-                                        if w == u64::from_le_bytes(*b"purchase") {
-                                            Some(true)
-                                        } else {
-                                            None
-                                        }
+                                }
+                                8 => {
+                                    let w = u64::from_le_bytes(unsafe {
+                                        *(f5.as_ptr() as *const [u8; 8])
+                                    });
+                                    if w == u64::from_le_bytes(*b"purchase") {
+                                        Some(true)
+                                    } else {
+                                        None
                                     }
-                                    _ => None,
-                                };
-                                if let Some(is_p) = is_p {
-                                    if let Some(ts) = dc.parse_ts(f3) {
-                                        if ts >= win_start
-                                            && ts < win_end
-                                            && (ingest_ts - ts) <= MS_PER_DAY
-                                        {
-                                            if is_p {
-                                                if let Some(pr) = parse_price(f7) {
-                                                    raw_uid = pack64(f2, ep_aid, &mut ev_parena);
-                                                    let cat = if let Some(pid) =
-                                                        parse_prefixed_uint(f6, b"p")
+                                }
+                                _ => None,
+                            };
+                            if let Some(is_p) = is_p {
+                                if let Some(ts) = dc.parse_ts(f3) {
+                                    if ts >= win_start
+                                        && ts < win_end
+                                        && (ingest_ts - ts) <= MS_PER_DAY
+                                    {
+                                        if is_p {
+                                            if let Some(pr) = parse_price(f7) {
+                                                raw_uid = pack64(f2, ep_aid, &mut ev_parena);
+                                                let cat =
+                                                    if let Some(pid) = parse_prefixed_uint(f6, b"p")
                                                     {
                                                         if pid < prod_fast.len() {
                                                             unsafe { *prod_fast.get_unchecked(pid) }
@@ -2509,381 +2672,380 @@ fn main() {
                                                     } else {
                                                         prod_fallback.get(f6).unwrap_or(0)
                                                     };
-                                                    ts_off = (ts - win_start) as u32;
-                                                    price_cat = pr | ((cat as u32) << 24);
-                                                }
-                                            } else {
-                                                raw_uid = pack64(f2, ep_aid, &mut ev_parena);
                                                 ts_off = (ts - win_start) as u32;
+                                                price_cat = pr | ((cat as u32) << 24);
                                             }
+                                        } else {
+                                            raw_uid = pack64(f2, ep_aid, &mut ev_parena);
+                                            ts_off = (ts - win_start) as u32;
                                         }
                                     }
                                 }
                             }
-
-                            ev_writer.push(
-                                (eid_h >> 57) as usize,
-                                RawEvent {
-                                    eid,
-                                    ingest_s,
-                                    eid_h: eid_h as u32,
-                                    raw_uid,
-                                    ts_off,
-                                    price_cat,
-                                },
-                            );
-                        });
-                    }
-
-                    let mut cid_arena: Vec<u8> = Vec::new();
-                    let mut cl_parena: Vec<u8> = Vec::new();
-                    let c_aid = tid as u8;
-                    let cp_aid = (2 * ncpu + tid) as u8;
-
-                    if use_region_batch {
-                        let mut cl_u_writer =
-                            ShardWriter::<UClick, ID_REGIONS, 8>::new(ZERO_UCLICK, est_ucl);
-                        loop {
-                            let ci = next_cl_chunk.fetch_add(1, AtomicOrd::Relaxed);
-                            if ci >= click_chunks.len() {
-                                break;
-                            }
-                            let (fi, s0, e0) = click_chunks[ci];
-                            let slice = resolve_chunk(
-                                unsafe { click_files_slots[fi].get() }.as_slice(),
-                                s0,
-                                e0,
-                            );
-                            if slice.is_empty() {
-                                continue;
-                            }
-                            scan_slice::<3, _>(slice, use_avx2, |line, c, cnt, q| {
-                                if cnt != 3 {
-                                    return;
-                                }
-                                let Some([f1, f2, f3, f4]) = split_fields::<3, 4>(line, c, q) else {
-                                    return;
-                                };
-                                if f1.is_empty() || f2.is_empty() {
-                                    return;
-                                }
-                                let Some(ts) = dc.parse_ts(f4) else {
-                                    return;
-                                };
-                                if ts < click_win_start || ts >= win_end {
-                                    return;
-                                }
-                                let camp_idx = if let Some(cid) = parse_prefixed_uint(f3, b"c_") {
-                                    if cid < camp_fast.len() {
-                                        unsafe { *camp_fast.get_unchecked(cid) }
-                                    } else {
-                                        0
-                                    }
-                                } else {
-                                    camp_fallback.get(f3).unwrap_or(0)
-                                };
-                                if camp_idx == 0 {
-                                    return;
-                                }
-                                let cid = pack64(f1, c_aid, &mut cid_arena);
-                                let (uid, uh) = match pack64_try_inline(f2) {
-                                    Some(p) => (p, mix64(p)),
-                                    None => (
-                                        pack64_overflow(f2, cp_aid, &mut cl_parena),
-                                        hash_bytes(f2),
-                                    ),
-                                };
-                                cl_u_writer.push(
-                                    id_region(uh),
-                                    UClick {
-                                        uid,
-                                        uh,
-                                        cid,
-                                        ts_off: (ts - click_win_start) as u32,
-                                        camp: camp_idx,
-                                    },
-                                );
-                            });
                         }
-                        unsafe { ucl_slots[tid].set(cl_u_writer.finish()) };
-                    } else {
-                        let mut flat_cl = Vec::with_capacity(est_cl_flat);
-                        loop {
-                            let ci = next_cl_chunk.fetch_add(1, AtomicOrd::Relaxed);
-                            if ci >= click_chunks.len() {
-                                break;
+
+                        ev_writer.push(
+                            (eid_h >> 57) as usize,
+                            RawEvent {
+                                eid,
+                                ingest_s,
+                                eid_h: eid_h as u32,
+                                raw_uid,
+                                ts_off,
+                                price_cat,
+                            },
+                        );
+                    });
+                }
+
+                let mut cid_arena = Vec::new();
+                let mut cl_parena = Vec::new();
+                let c_aid = tid as u8;
+                let cp_aid = (2 * ncpu + tid) as u8;
+
+                if meta.use_region_batch {
+                    let mut cl_u_writer =
+                        ShardWriter::<UClick, ID_REGIONS, 8>::new(ZERO_UCLICK, meta.est_ucl);
+                    loop {
+                        let ci = next_cl_chunk.fetch_add(1, AtomicOrd::Relaxed);
+                        if ci >= meta.click_chunks.len() {
+                            break;
+                        }
+                        let (fi, s0, e0) = meta.click_chunks[ci];
+                        let slice =
+                            resolve_chunk(unsafe { click_files[fi].get().as_slice() }, s0, e0);
+                        if slice.is_empty() {
+                            continue;
+                        }
+                        scan_slice::<3, _>(slice, use_avx2, |line, c, cnt, q| {
+                            if cnt != 3 {
+                                return;
                             }
-                            let (fi, s0, e0) = click_chunks[ci];
-                            let slice = resolve_chunk(
-                                unsafe { click_files_slots[fi].get() }.as_slice(),
-                                s0,
-                                e0,
-                            );
-                            if slice.is_empty() {
-                                continue;
+                            let Some([f1, f2, f3, f4]) = split_fields::<3, 4>(line, c, q) else {
+                                return;
+                            };
+                            if f1.is_empty() || f2.is_empty() {
+                                return;
                             }
-                            scan_slice::<3, _>(slice, use_avx2, |line, c, cnt, q| {
-                                if cnt != 3 {
-                                    return;
-                                }
-                                let Some([f1, f2, f3, f4]) = split_fields::<3, 4>(line, c, q) else {
-                                    return;
-                                };
-                                if f1.is_empty() || f2.is_empty() {
-                                    return;
-                                }
-                                let Some(ts) = dc.parse_ts(f4) else {
-                                    return;
-                                };
-                                if ts < click_win_start || ts >= win_end {
-                                    return;
-                                }
-                                let camp_idx = if let Some(cid) = parse_prefixed_uint(f3, b"c_") {
-                                    if cid < camp_fast.len() {
-                                        unsafe { *camp_fast.get_unchecked(cid) }
-                                    } else {
-                                        0
-                                    }
+                            let Some(ts) = dc.parse_ts(f4) else {
+                                return;
+                            };
+                            if ts < click_win_start || ts >= win_end {
+                                return;
+                            }
+                            let camp_idx = if let Some(cid) = parse_prefixed_uint(f3, b"c_") {
+                                if cid < camp_fast.len() {
+                                    unsafe { *camp_fast.get_unchecked(cid) }
                                 } else {
-                                    camp_fallback.get(f3).unwrap_or(0)
-                                };
-                                if camp_idx == 0 {
-                                    return;
+                                    0
                                 }
-                                let cid = pack64(f1, c_aid, &mut cid_arena);
-                                let (uid, uh) = match pack64_try_inline(f2) {
-                                    Some(p) => (p, mix64(p)),
-                                    None => (
-                                        pack64_overflow(f2, cp_aid, &mut cl_parena),
-                                        hash_bytes(f2),
-                                    ),
-                                };
-                                flat_cl.push(UClick {
+                            } else {
+                                camp_fallback.get(f3).unwrap_or(0)
+                            };
+                            if camp_idx == 0 {
+                                return;
+                            }
+                            let cid = pack64(f1, c_aid, &mut cid_arena);
+                            let (uid, uh) = match pack64_try_inline(f2) {
+                                Some(p) => (p, mix64(p)),
+                                None => (
+                                    pack64_overflow(f2, cp_aid, &mut cl_parena),
+                                    hash_bytes(f2),
+                                ),
+                            };
+                            cl_u_writer.push(
+                                id_region(uh),
+                                UClick {
                                     uid,
                                     uh,
                                     cid,
                                     ts_off: (ts - click_win_start) as u32,
                                     camp: camp_idx,
-                                });
+                                },
+                            );
+                        });
+                    }
+                    unsafe { ucl_slots[tid].set(cl_u_writer.finish()) };
+                } else {
+                    let mut flat_cl = Vec::with_capacity(meta.est_cl_flat);
+                    loop {
+                        let ci = next_cl_chunk.fetch_add(1, AtomicOrd::Relaxed);
+                        if ci >= meta.click_chunks.len() {
+                            break;
+                        }
+                        let (fi, s0, e0) = meta.click_chunks[ci];
+                        let slice =
+                            resolve_chunk(unsafe { click_files[fi].get().as_slice() }, s0, e0);
+                        if slice.is_empty() {
+                            continue;
+                        }
+                        scan_slice::<3, _>(slice, use_avx2, |line, c, cnt, q| {
+                            if cnt != 3 {
+                                return;
+                            }
+                            let Some([f1, f2, f3, f4]) = split_fields::<3, 4>(line, c, q) else {
+                                return;
+                            };
+                            if f1.is_empty() || f2.is_empty() {
+                                return;
+                            }
+                            let Some(ts) = dc.parse_ts(f4) else {
+                                return;
+                            };
+                            if ts < click_win_start || ts >= win_end {
+                                return;
+                            }
+                            let camp_idx = if let Some(cid) = parse_prefixed_uint(f3, b"c_") {
+                                if cid < camp_fast.len() {
+                                    unsafe { *camp_fast.get_unchecked(cid) }
+                                } else {
+                                    0
+                                }
+                            } else {
+                                camp_fallback.get(f3).unwrap_or(0)
+                            };
+                            if camp_idx == 0 {
+                                return;
+                            }
+                            let cid = pack64(f1, c_aid, &mut cid_arena);
+                            let (uid, uh) = match pack64_try_inline(f2) {
+                                Some(p) => (p, mix64(p)),
+                                None => (
+                                    pack64_overflow(f2, cp_aid, &mut cl_parena),
+                                    hash_bytes(f2),
+                                ),
+                            };
+                            flat_cl.push(UClick {
+                                uid,
+                                uh,
+                                cid,
+                                ts_off: (ts - click_win_start) as u32,
+                                camp: camp_idx,
                             });
+                        });
+                    }
+                    unsafe { flat_cl_slots[tid].set(flat_cl) };
+                }
+
+                unsafe {
+                    raw_ev_slots[tid].set(ev_writer.finish());
+                    eid_arena_slots[tid].set(eid_arena);
+                    ev_parena_slots[tid].set(ev_parena);
+                    cid_arena_slots[tid].set(cid_arena);
+                    cl_parena_slots[tid].set(cl_parena);
+                }
+                barrier.wait();
+
+                if tid == 0 {
+                    let mut p_arenas = Vec::with_capacity(ncpu * 3);
+                    p_arenas.extend(unsafe { link_arenas_cell.take() });
+                    for t in 0..ncpu {
+                        p_arenas.push(unsafe { ev_parena_slots[t].take() });
+                    }
+                    for t in 0..ncpu {
+                        p_arenas.push(unsafe { cl_parena_slots[t].take() });
+                    }
+                    let mut e_arenas = Vec::with_capacity(ncpu);
+                    let mut c_arenas = Vec::with_capacity(ncpu);
+                    for t in 0..ncpu {
+                        e_arenas.push(unsafe { eid_arena_slots[t].take() });
+                        c_arenas.push(unsafe { cid_arena_slots[t].take() });
+                    }
+                    let all_eids_inline = e_arenas.iter().all(|a| a.is_empty());
+                    let all_persons_inline = p_arenas.iter().all(|a| a.is_empty());
+                    let all_cids_inline = c_arenas.iter().all(|a| a.is_empty());
+                    let _ = inline_flags_cell.set((
+                        all_eids_inline,
+                        all_persons_inline,
+                        all_cids_inline,
+                    ));
+                    let _ = person_arenas_cell.set(p_arenas);
+                    let _ = eid_arenas_cell.set(e_arenas);
+                    let _ = cid_arenas_cell.set(c_arenas);
+                }
+                barrier.wait();
+
+                let (all_eids_inline, all_persons_inline, all_cids_inline) =
+                    *inline_flags_cell.get().unwrap();
+                if trace && tid == 0 {
+                    eprintln!(
+                        "[{:7.3} s] parse done (events + clicks, inline=({all_eids_inline},{all_persons_inline},{all_cids_inline}))",
+                        t_start.elapsed().as_secs_f64()
+                    );
+                }
+
+                // ---- WAVE 2: Dedup 128 shards & resolve persons -> 64 PERSON_SHARDS ----
+                let id_lookup = id_lookup_cell.get().unwrap();
+                let person_arenas = person_arenas_cell.get().unwrap();
+                let eid_arenas = eid_arenas_cell.get().unwrap();
+                let cid_arenas = cid_arenas_cell.get().unwrap();
+
+                let mut tab32: Vec<u32> = Vec::new();
+                let mut tab64: Vec<u64> = Vec::new();
+                let mut unique_ev: Vec<RawEvent> = Vec::new();
+
+                if meta.use_region_batch {
+                    let mut uev_writer =
+                        ShardWriter::<UEvent, ID_REGIONS, 8>::new(ZERO_UEVENT, meta.est_uev);
+                    loop {
+                        let sh = next_dedup_ev.fetch_add(1, AtomicOrd::Relaxed);
+                        if sh >= DEDUP_SHARDS {
+                            break;
                         }
-                        unsafe { flat_cl_slots[tid].set(flat_cl) };
+                        let n: usize = shard_segs(raw_ev_slots, sh).map(|x| x.len()).sum();
+                        if n == 0 {
+                            continue;
+                        }
+                        dedup_event_shard(
+                            raw_ev_slots,
+                            sh,
+                            n,
+                            eid_arenas,
+                            all_eids_inline,
+                            &mut tab32,
+                            &mut tab64,
+                            &mut unique_ev,
+                        );
+
+                        let nu = unique_ev.len();
+                        for j in 0..nu {
+                            if j + PF_DIST < nu && !all_persons_inline {
+                                let nx = unsafe { unique_ev.get_unchecked(j + PF_DIST) };
+                                if nx.ts_off != u32::MAX {
+                                    prefetch_pack64(nx.raw_uid, person_arenas);
+                                }
+                            }
+                            let ev = unsafe { unique_ev.get_unchecked(j) };
+                            if ev.ts_off != u32::MAX {
+                                let uh = if all_persons_inline {
+                                    mix64(ev.raw_uid)
+                                } else {
+                                    hash_pack64(ev.raw_uid, person_arenas)
+                                };
+                                uev_writer.push(
+                                    id_region(uh),
+                                    UEvent {
+                                        uid: ev.raw_uid,
+                                        uh,
+                                        ts_off: ev.ts_off,
+                                        price_cat: ev.price_cat,
+                                    },
+                                );
+                            }
+                        }
                     }
 
+                    std::mem::forget(unique_ev);
+                    std::mem::forget(tab32);
+                    std::mem::forget(tab64);
+                    unsafe { uev_slots[tid].set(uev_writer.finish()) };
+                    barrier.wait();
+
+                    let mut ev_p_writer = ShardWriter::<ValidEvent, PERSON_SHARDS, 16>::new(
+                        ZERO_VALID_EVENT,
+                        meta.est_ev_person,
+                    );
+                    let mut cl_p_writer = ShardWriter::<ValidClick, PERSON_SHARDS, 8>::new(
+                        ZERO_VALID_CLICK,
+                        meta.est_cl_person,
+                    );
+                    loop {
+                        let r = next_region.fetch_add(1, AtomicOrd::Relaxed);
+                        if r >= ID_REGIONS {
+                            break;
+                        }
+                        for slice in shard_segs(uev_slots, r) {
+                            let slice: &[UEvent] = slice;
+                            for (j, ev) in slice.iter().enumerate() {
+                                if let Some(nx) = slice.get(j + PF_DIST) {
+                                    id_lookup.prefetch_bloom(nx.uh);
+                                }
+                                if let Some(nx) = slice.get(j + PF_DIST / 2) {
+                                    if id_lookup.prefetch_slot(nx.uh) && !all_persons_inline {
+                                        prefetch_pack64(nx.uid, person_arenas);
+                                    }
+                                }
+                                let (person, ph) = if all_persons_inline {
+                                    id_lookup.resolve_inline(ev.uid, ev.uh)
+                                } else {
+                                    id_lookup.resolve_hashed(ev.uid, ev.uh, person_arenas)
+                                };
+                                ev_p_writer.push(
+                                    (ph >> 58) as usize,
+                                    ValidEvent {
+                                        person,
+                                        ts_off: ev.ts_off,
+                                        price_cat: ev.price_cat,
+                                    },
+                                );
+                            }
+                        }
+                        for slice in shard_segs(ucl_slots, r) {
+                            let slice: &[UClick] = slice;
+                            for (j, cl) in slice.iter().enumerate() {
+                                if let Some(nx) = slice.get(j + PF_DIST) {
+                                    id_lookup.prefetch_bloom(nx.uh);
+                                }
+                                if let Some(nx) = slice.get(j + PF_DIST / 2) {
+                                    if id_lookup.prefetch_slot(nx.uh) && !all_persons_inline {
+                                        prefetch_pack64(nx.uid, person_arenas);
+                                    }
+                                }
+                                let (person, ph) = if all_persons_inline {
+                                    id_lookup.resolve_inline(cl.uid, cl.uh)
+                                } else {
+                                    id_lookup.resolve_hashed(cl.uid, cl.uh, person_arenas)
+                                };
+                                cl_p_writer.push(
+                                    (ph >> 58) as usize,
+                                    ValidClick {
+                                        person,
+                                        cid: cl.cid,
+                                        ts_off: cl.ts_off,
+                                        campaign_idx: cl.camp,
+                                    },
+                                );
+                            }
+                        }
+                    }
                     unsafe {
-                        raw_ev_slots[tid].set(ev_writer.finish());
-                        eid_arena_slots[tid].set(eid_arena);
-                        ev_parena_slots[tid].set(ev_parena);
-                        cid_arena_slots[tid].set(cid_arena);
-                        cl_parena_slots[tid].set(cl_parena);
+                        ev_person_slots[tid].set(ev_p_writer.finish());
+                        cl_person_slots[tid].set(cl_p_writer.finish());
                     }
-                    barrier.wait();
+                } else {
+                    let mut ev_p_writer = ShardWriter::<ValidEvent, PERSON_SHARDS, 16>::new(
+                        ZERO_VALID_EVENT,
+                        meta.est_ev_person,
+                    );
+                    let mut cl_p_writer = ShardWriter::<ValidClick, PERSON_SHARDS, 8>::new(
+                        ZERO_VALID_CLICK,
+                        meta.est_cl_person,
+                    );
+                    let pf_bloom = id_lookup.bloom.len() > 8_192;
 
-                    if tid == 0 {
-                        let mut p_arenas = Vec::with_capacity(ncpu * 3);
-                        p_arenas.extend(unsafe { link_arenas_cell.take() });
-                        for t in 0..ncpu {
-                            p_arenas.push(unsafe { ev_parena_slots[t].take() });
+                    loop {
+                        let sh = next_dedup_ev.fetch_add(1, AtomicOrd::Relaxed);
+                        if sh >= DEDUP_SHARDS {
+                            break;
                         }
-                        for t in 0..ncpu {
-                            p_arenas.push(unsafe { cl_parena_slots[t].take() });
+                        let n: usize = shard_segs(raw_ev_slots, sh).map(|x| x.len()).sum();
+                        if n == 0 {
+                            continue;
                         }
-                        let mut e_arenas = Vec::with_capacity(ncpu);
-                        let mut c_arenas = Vec::with_capacity(ncpu);
-                        for t in 0..ncpu {
-                            e_arenas.push(unsafe { eid_arena_slots[t].take() });
-                            c_arenas.push(unsafe { cid_arena_slots[t].take() });
-                        }
-                        let all_person_inline = p_arenas.iter().all(|a| a.is_empty());
-                        let _ = all_person_inline_cell.set(all_person_inline);
-                        let _ = person_arenas_cell.set(p_arenas);
-                        let _ = eid_arenas_cell.set(e_arenas);
-                        let _ = cid_arenas_cell.set(c_arenas);
-                    }
-                    barrier.wait();
-                    let all_person_inline = *all_person_inline_cell.get().unwrap();
-                    if trace && tid == 0 {
-                        eprintln!(
-                            "[{:7.3} s] parse done (events + clicks, inline_persons={})",
-                            t_start.elapsed().as_secs_f64(),
-                            all_person_inline
-                        );
-                    }
-
-                    // ---- WAVE 2: Dedup events & resolve persons ----
-                    let id_lookup = id_lookup_cell.get().unwrap();
-                    let person_arenas = person_arenas_cell.get().unwrap();
-                    let eid_arenas = eid_arenas_cell.get().unwrap();
-                    let cid_arenas = cid_arenas_cell.get().unwrap();
-
-                    let mut tab32: Vec<u32> = Vec::new();
-                    let mut tab64: Vec<u64> = Vec::new();
-                    let mut unique_ev: Vec<RawEvent> = Vec::new();
-
-                    if use_region_batch {
-                        let mut uev_writer =
-                            ShardWriter::<UEvent, ID_REGIONS, 16>::new(ZERO_UEVENT, est_uev);
-                        loop {
-                            let sh = next_dedup_ev.fetch_add(1, AtomicOrd::Relaxed);
-                            if sh >= DEDUP_SHARDS {
-                                break;
-                            }
-                            let n: usize = shard_segs(raw_ev_slots, sh).map(|x| x.len()).sum();
-                            if n == 0 {
-                                continue;
-                            }
-                            dedup_event_shard(
-                                raw_ev_slots,
-                                sh,
-                                n,
-                                eid_arenas,
-                                &mut tab32,
-                                &mut tab64,
-                                &mut unique_ev,
-                            );
-
-                            let nu = unique_ev.len();
-                            for j in 0..nu {
-                                if !all_person_inline && j + PF_DIST < nu {
-                                    let nx = unsafe { unique_ev.get_unchecked(j + PF_DIST) };
-                                    if nx.ts_off != u32::MAX {
-                                        prefetch_pack64(nx.raw_uid, person_arenas);
-                                    }
-                                }
-                                let ev = unsafe { unique_ev.get_unchecked(j) };
-                                if ev.ts_off != u32::MAX {
-                                    let uh = if all_person_inline {
-                                        mix64(ev.raw_uid)
-                                    } else {
-                                        hash_pack64(ev.raw_uid, person_arenas)
-                                    };
-                                    uev_writer.push(
-                                        id_region(uh),
-                                        UEvent {
-                                            uid: ev.raw_uid,
-                                            uh,
-                                            ts_off: ev.ts_off,
-                                            price_cat: ev.price_cat,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-
-                        std::mem::forget(unique_ev);
-                        std::mem::forget(tab32);
-                        std::mem::forget(tab64);
-                        unsafe { uev_slots[tid].set(uev_writer.finish()) };
-                        barrier.wait();
-                        if trace && tid == 0 {
-                            eprintln!(
-                                "[{:7.3} s] wave 2 done (dedup)",
-                                t_start.elapsed().as_secs_f64()
-                            );
-                        }
-
-                        let mut ev_p_writer = ShardWriter::<ValidEvent, PERSON_SHARDS, 16>::new(
-                            ZERO_VALID_EVENT,
-                            est_ev_person,
-                        );
-                        let mut cl_p_writer = ShardWriter::<ValidClick, PERSON_SHARDS, 8>::new(
-                            ZERO_VALID_CLICK,
-                            est_cl_person,
-                        );
-                        loop {
-                            let r = next_region.fetch_add(1, AtomicOrd::Relaxed);
-                            if r >= ID_REGIONS {
-                                break;
-                            }
-                            for slice in shard_segs(uev_slots, r) {
-                                let slice: &[UEvent] = slice;
-                                for (j, ev) in slice.iter().enumerate() {
-                                    if let Some(nx) = slice.get(j + PF_DIST) {
-                                        id_lookup.prefetch_bloom(nx.uh);
-                                    }
-                                    if let Some(nx) = slice.get(j + PF_DIST / 2) {
-                                        if id_lookup.prefetch_slot(nx.uh) && !all_person_inline {
-                                            prefetch_pack64(nx.uid, person_arenas);
-                                        }
-                                    }
-                                    let (person, ph) = if all_person_inline {
-                                        id_lookup.resolve_hashed_inline(ev.uid, ev.uh)
-                                    } else {
-                                        id_lookup.resolve_hashed(ev.uid, ev.uh, person_arenas)
-                                    };
-                                    ev_p_writer.push(
-                                        (ph >> 58) as usize,
-                                        ValidEvent {
-                                            person,
-                                            ts_off: ev.ts_off,
-                                            price_cat: ev.price_cat,
-                                        },
-                                    );
-                                }
-                            }
-                            for slice in shard_segs(ucl_slots, r) {
-                                let slice: &[UClick] = slice;
-                                for (j, cl) in slice.iter().enumerate() {
-                                    if let Some(nx) = slice.get(j + PF_DIST) {
-                                        id_lookup.prefetch_bloom(nx.uh);
-                                    }
-                                    if let Some(nx) = slice.get(j + PF_DIST / 2) {
-                                        if id_lookup.prefetch_slot(nx.uh) && !all_person_inline {
-                                            prefetch_pack64(nx.uid, person_arenas);
-                                        }
-                                    }
-                                    let (person, ph) = if all_person_inline {
-                                        id_lookup.resolve_hashed_inline(cl.uid, cl.uh)
-                                    } else {
-                                        id_lookup.resolve_hashed(cl.uid, cl.uh, person_arenas)
-                                    };
-                                    cl_p_writer.push(
-                                        (ph >> 58) as usize,
-                                        ValidClick {
-                                            person,
-                                            cid: cl.cid,
-                                            ts_off: cl.ts_off,
-                                            campaign_idx: cl.camp,
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        unsafe {
-                            ev_person_slots[tid].set(ev_p_writer.finish());
-                            cl_person_slots[tid].set(cl_p_writer.finish());
-                        }
-                    } else {
-                        let mut ev_p_writer = ShardWriter::<ValidEvent, PERSON_SHARDS, 16>::new(
-                            ZERO_VALID_EVENT,
-                            est_ev_person,
-                        );
-                        let mut cl_p_writer = ShardWriter::<ValidClick, PERSON_SHARDS, 8>::new(
-                            ZERO_VALID_CLICK,
-                            est_cl_person,
+                        dedup_event_shard(
+                            raw_ev_slots,
+                            sh,
+                            n,
+                            eid_arenas,
+                            all_eids_inline,
+                            &mut tab32,
+                            &mut tab64,
+                            &mut unique_ev,
                         );
 
-                        loop {
-                            let sh = next_dedup_ev.fetch_add(1, AtomicOrd::Relaxed);
-                            if sh >= DEDUP_SHARDS {
-                                break;
-                            }
-                            let n: usize = shard_segs(raw_ev_slots, sh).map(|x| x.len()).sum();
-                            if n == 0 {
-                                continue;
-                            }
-                            dedup_event_shard(
-                                raw_ev_slots,
-                                sh,
-                                n,
-                                eid_arenas,
-                                &mut tab32,
-                                &mut tab64,
-                                &mut unique_ev,
-                            );
-
-                            let nu = unique_ev.len();
-                            if all_person_inline {
+                        let nu = unique_ev.len();
+                        if all_persons_inline {
+                            if pf_bloom {
                                 for j in 0..nu {
                                     if j + PF_DIST < nu {
                                         let nx = unsafe { unique_ev.get_unchecked(j + PF_DIST) };
@@ -2895,7 +3057,7 @@ fn main() {
                                     if ev.ts_off != u32::MAX {
                                         let uh = mix64(ev.raw_uid);
                                         let (person, ph) =
-                                            id_lookup.resolve_hashed_inline(ev.raw_uid, uh);
+                                            id_lookup.resolve_inline(ev.raw_uid, uh);
                                         ev_p_writer.push(
                                             (ph >> 58) as usize,
                                             ValidEvent {
@@ -2907,25 +3069,12 @@ fn main() {
                                     }
                                 }
                             } else {
-                                for j in 0..nu {
-                                    if j + PF_DIST < nu {
-                                        let nx = unsafe { unique_ev.get_unchecked(j + PF_DIST) };
-                                        if nx.ts_off != u32::MAX {
-                                            if (nx.raw_uid >> 63) == 0 {
-                                                id_lookup.prefetch_bloom(mix64(nx.raw_uid));
-                                            } else {
-                                                prefetch_pack64(nx.raw_uid, person_arenas);
-                                            }
-                                        }
-                                    }
-                                    let ev = unsafe { unique_ev.get_unchecked(j) };
+                                // Bloom filter fits in L1/L2: avoid redundant mix64 + prefetch
+                                for ev in &unique_ev {
                                     if ev.ts_off != u32::MAX {
-                                        let uh = hash_pack64(ev.raw_uid, person_arenas);
-                                        let (person, ph) = id_lookup.resolve_hashed(
-                                            ev.raw_uid,
-                                            uh,
-                                            person_arenas,
-                                        );
+                                        let uh = mix64(ev.raw_uid);
+                                        let (person, ph) =
+                                            id_lookup.resolve_inline(ev.raw_uid, uh);
                                         ev_p_writer.push(
                                             (ph >> 58) as usize,
                                             ValidEvent {
@@ -2937,20 +3086,64 @@ fn main() {
                                     }
                                 }
                             }
+                        } else {
+                            for j in 0..nu {
+                                if j + PF_DIST < nu {
+                                    let nx = unsafe { unique_ev.get_unchecked(j + PF_DIST) };
+                                    if nx.ts_off != u32::MAX {
+                                        if (nx.raw_uid >> 63) == 0 {
+                                            if pf_bloom {
+                                                id_lookup.prefetch_bloom(mix64(nx.raw_uid));
+                                            }
+                                        } else {
+                                            prefetch_pack64(nx.raw_uid, person_arenas);
+                                        }
+                                    }
+                                }
+                                let ev = unsafe { unique_ev.get_unchecked(j) };
+                                if ev.ts_off != u32::MAX {
+                                    let uh = hash_pack64(ev.raw_uid, person_arenas);
+                                    let (person, ph) =
+                                        id_lookup.resolve_hashed(ev.raw_uid, uh, person_arenas);
+                                    ev_p_writer.push(
+                                        (ph >> 58) as usize,
+                                        ValidEvent {
+                                            person,
+                                            ts_off: ev.ts_off,
+                                            price_cat: ev.price_cat,
+                                        },
+                                    );
+                                }
+                            }
                         }
+                    }
 
-                        let my_clicks = unsafe { flat_cl_slots[tid].get() };
+                    let my_clicks = unsafe { flat_cl_slots[tid].get() };
+                    if all_persons_inline && !pf_bloom {
+                        for cl in my_clicks {
+                            let (person, ph) = id_lookup.resolve_inline(cl.uid, cl.uh);
+                            cl_p_writer.push(
+                                (ph >> 58) as usize,
+                                ValidClick {
+                                    person,
+                                    cid: cl.cid,
+                                    ts_off: cl.ts_off,
+                                    campaign_idx: cl.camp,
+                                },
+                            );
+                        }
+                    } else {
                         for (j, cl) in my_clicks.iter().enumerate() {
                             if let Some(nx) = my_clicks.get(j + PF_DIST) {
                                 id_lookup.prefetch_bloom(nx.uh);
                             }
                             if let Some(nx) = my_clicks.get(j + PF_DIST / 2) {
-                                if id_lookup.prefetch_slot(nx.uh) && !all_person_inline {
+                                if id_lookup.prefetch_slot(nx.uh) && !all_persons_inline {
                                     prefetch_pack64(nx.uid, person_arenas);
                                 }
                             }
-                            let (person, ph) = if all_person_inline {
-                                id_lookup.resolve_hashed_inline(cl.uid, cl.uh)
+                            let (person, ph) = if all_persons_inline {
+                                id_lookup.resolve_inline(cl.uid, cl.uh)
                             } else {
                                 id_lookup.resolve_hashed(cl.uid, cl.uh, person_arenas)
                             };
@@ -2964,133 +3157,131 @@ fn main() {
                                 },
                             );
                         }
-
-                        std::mem::forget(unique_ev);
-                        std::mem::forget(tab32);
-                        std::mem::forget(tab64);
-                        unsafe {
-                            ev_person_slots[tid].set(ev_p_writer.finish());
-                            cl_person_slots[tid].set(cl_p_writer.finish());
-                        }
                     }
 
-                    barrier.wait();
-
-                    if tid == 0 {
-                        let mut order: Vec<(usize, usize)> = (0..PERSON_SHARDS)
-                            .map(|ps| {
-                                let cnt: usize =
-                                    shard_segs(ev_person_slots, ps).map(|x| x.len()).sum();
-                                (ps, cnt)
-                            })
-                            .collect();
-                        order.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-                        let _ = shard_order_cell.set(order);
+                    std::mem::forget(unique_ev);
+                    std::mem::forget(tab32);
+                    std::mem::forget(tab64);
+                    unsafe {
+                        ev_person_slots[tid].set(ev_p_writer.finish());
+                        cl_person_slots[tid].set(cl_p_writer.finish());
                     }
-                    barrier.wait();
-                    if trace && tid == 0 {
-                        eprintln!(
-                            "[{:7.3} s] wave 2 done (dedup + resolve); shard order ready",
-                            t_start.elapsed().as_secs_f64()
-                        );
+                }
+
+                barrier.wait();
+
+                if tid == 0 {
+                    let mut order: Vec<(usize, usize)> = (0..PERSON_SHARDS)
+                        .map(|ps| {
+                            let cnt: usize =
+                                shard_segs(ev_person_slots, ps).map(|x| x.len()).sum();
+                            (ps, cnt)
+                        })
+                        .collect();
+                    order.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                    let _ = shard_order_cell.set(order);
+                }
+                barrier.wait();
+                if trace && tid == 0 {
+                    eprintln!(
+                        "[{:7.3} s] wave 2 done (dedup + resolve); shard order ready",
+                        t_start.elapsed().as_secs_f64()
+                    );
+                }
+
+                // ---- WAVE 3: Group-by-person, sessionize, write Parquet via writev ----
+                let t_w3_init = if trace {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+
+                let shard_order = shard_order_cell.get().unwrap();
+                let mut pid_tab: Vec<u32> = Vec::new();
+                let mut person_keys: Vec<u64> = Vec::new();
+                let mut ev_counts: Vec<u32> = Vec::new();
+                let mut ev_pids: Vec<u32> = Vec::new();
+                let mut ev_offsets: Vec<u32> = Vec::new();
+                let mut ev_cursor: Vec<u32> = Vec::new();
+                let mut grouped_ev: Vec<u64> = Vec::new();
+
+                let mut cl_counts: Vec<u32> = Vec::new();
+                let mut matched_cl: Vec<(u32, ClickPacked)> = Vec::new();
+                let mut cl_offsets: Vec<u32> = Vec::new();
+                let mut cl_cursor: Vec<u32> = Vec::new();
+                let mut grouped_cl: Vec<ClickPacked> = Vec::new();
+
+                let mut camp_counts = vec![0u32; num_campaigns];
+                let mut active_camps: Vec<u16> = Vec::new();
+                let mut cat_rev_arr = vec![0i64; num_categories];
+                let mut touched_cats: Vec<u8> = Vec::new();
+                let mut camp_flat = zeroed_vec::<CampaignDayAgg>(flat_camp_len);
+
+                let mut out_rows = 0usize;
+                let mut uid_plain: Vec<u8> =
+                    Vec::with_capacity(meta.est_out_rows_per_worker * 16);
+                let mut day_col: Vec<i32> = Vec::with_capacity(meta.est_out_rows_per_worker);
+                let mut sess_col: Vec<i32> = Vec::with_capacity(meta.est_out_rows_per_worker);
+                let mut ev_col: Vec<i32> = Vec::with_capacity(meta.est_out_rows_per_worker);
+                let mut rev_col: Vec<i64> = Vec::with_capacity(meta.est_out_rows_per_worker);
+                let mut cat_def_bits: Vec<u8> =
+                    Vec::with_capacity(meta.est_out_rows_per_worker / 8 + 64);
+                let mut cat_plain: Vec<u8> =
+                    Vec::with_capacity(meta.est_out_rows_per_worker * 8);
+                let mut uid_entry_buf = [0u8; 64];
+
+                let init_ns = t_w3_init.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+                let mut group_ns = 0u64;
+                let mut sess_ns = 0u64;
+
+                loop {
+                    let ord_idx = next_person_shard.fetch_add(1, AtomicOrd::Relaxed);
+                    if ord_idx >= PERSON_SHARDS {
+                        break;
+                    }
+                    let (ps, ev_total) = shard_order[ord_idx];
+                    if ev_total == 0 {
+                        continue;
                     }
 
-                    // ---- WAVE 3: Group-by-person, sessionize, write Parquet via writev ----
-                    let shard_order = shard_order_cell.get().unwrap();
-                    let mut pid_tab: Vec<u32> = Vec::new();
-                    let mut person_keys: Vec<u64> = Vec::new();
-                    let mut ev_counts: Vec<u32> = Vec::new();
-                    let mut ev_pids: Vec<u32> = Vec::new();
-                    let mut ev_offsets: Vec<u32> = Vec::new();
-                    let mut ev_cursor: Vec<u32> = Vec::new();
-                    let mut grouped_ev: Vec<u64> = Vec::new();
+                    let t_g0 = if trace {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
 
-                    let mut cl_counts: Vec<u32> = Vec::new();
-                    let mut matched_cl: Vec<(u32, ClickPacked)> = Vec::new();
-                    let mut cl_offsets: Vec<u32> = Vec::new();
-                    let mut cl_cursor: Vec<u32> = Vec::new();
-                    let mut grouped_cl: Vec<ClickPacked> = Vec::new();
+                    let (tag_mask, id_mask): (u32, u32) = if ev_total < (1 << 20) {
+                        (0xFFF0_0000, 0x000F_FFFF)
+                    } else {
+                        (0, u32::MAX)
+                    };
 
-                    let mut camp_counts = vec![0u32; num_campaigns];
-                    let mut active_camps: Vec<u16> = Vec::new();
-                    let mut cat_rev_arr = vec![0i64; num_categories];
-                    let mut touched_cats: Vec<u8> = Vec::new();
-                    let mut camp_flat = vec![CampaignDayAgg::default(); flat_camp_len];
+                    let est_persons = (ev_total / 12).max(64);
+                    let cap = (est_persons * 2).next_power_of_two().max(64);
+                    pid_tab.clear();
+                    pid_tab.resize(cap, 0);
+                    let mut mask = cap - 1;
+                    let mut grow_limit = (cap * 7) / 10;
+                    person_keys.clear();
+                    ev_counts.clear();
+                    ev_pids.clear();
+                    if ev_pids.capacity() < ev_total {
+                        ev_pids.reserve(ev_total - ev_pids.capacity());
+                    }
 
-                    let mut out_rows = 0usize;
-                    let mut uid_plain: Vec<u8> = Vec::with_capacity(est_out_rows_per_worker * 16);
-                    let mut day_col: Vec<i32> = Vec::with_capacity(est_out_rows_per_worker);
-                    let mut sess_col: Vec<i32> = Vec::with_capacity(est_out_rows_per_worker);
-                    let mut ev_col: Vec<i32> = Vec::with_capacity(est_out_rows_per_worker);
-                    let mut rev_col: Vec<i64> = Vec::with_capacity(est_out_rows_per_worker);
-                    let mut cat_def_bits: Vec<u8> =
-                        Vec::with_capacity(est_out_rows_per_worker / 8 + 64);
-                    let mut cat_plain: Vec<u8> = Vec::with_capacity(est_out_rows_per_worker * 8);
-                    let mut uid_scratch = [0u8; 10];
-                    let mut uid_entry_buf = [0u8; 64];
-
-                    let mut my_group_ns = 0u64;
-                    let mut my_sess_ns = 0u64;
-
-                    loop {
-                        let ord_idx = next_person_shard.fetch_add(1, AtomicOrd::Relaxed);
-                        if ord_idx >= PERSON_SHARDS {
-                            break;
-                        }
-                        let (ps, ev_total) = shard_order[ord_idx];
-                        if ev_total == 0 {
-                            continue;
-                        }
-
-                        let t0 = if trace {
-                            Some(std::time::Instant::now())
-                        } else {
-                            None
-                        };
-
-                        let (tag_mask, id_mask): (u32, u32) = if ev_total < (1 << 20) {
-                            (0xFFF0_0000, 0x000F_FFFF)
-                        } else {
-                            (0, u32::MAX)
-                        };
-
-                        let est_persons = (ev_total / 16).max(64);
-                        let cap = (est_persons * 2).next_power_of_two().max(64);
-                        pid_tab.clear();
-                        pid_tab.resize(cap, 0);
-                        let mut mask = cap - 1;
-                        person_keys.clear();
-                        ev_counts.clear();
-                        ev_pids.clear();
-                        if ev_pids.capacity() < ev_total {
-                            ev_pids.reserve(ev_total - ev_pids.capacity());
-                        }
-
-                        if all_person_inline {
+                    if all_persons_inline {
+                        if cap <= 16_384 {
+                            // L1/L2-resident pid_tab: skip redundant mix64 + prefetch
                             for slice in shard_segs(ev_person_slots, ps) {
                                 let slice: &[ValidEvent] = slice;
-                                for (j, &ev) in slice.iter().enumerate() {
-                                    if let Some(nx) = slice.get(j + DEDUP_PF) {
-                                        prefetch(unsafe {
-                                            pid_tab
-                                                .as_ptr()
-                                                .add((mix64(nx.person) as usize) & mask)
-                                        });
-                                    }
-                                    if (person_keys.len() + 1) * 10 >= pid_tab.len() * 7 {
-                                        let nc = pid_tab.len() * 2;
-                                        pid_tab.clear();
-                                        pid_tab.resize(nc, 0);
-                                        mask = nc - 1;
-                                        for (i, &pk) in person_keys.iter().enumerate() {
-                                            let h = mix64(pk);
-                                            let tag = ((h >> 26) as u32) & tag_mask;
-                                            let mut p = (h as usize) & mask;
-                                            while pid_tab[p] != 0 {
-                                                p = (p + 1) & mask;
-                                            }
-                                            pid_tab[p] = tag | ((i as u32) + 1);
-                                        }
+                                for &ev in slice {
+                                    if person_keys.len() >= grow_limit {
+                                        mask = grow_pid_tab_inline(
+                                            &mut pid_tab,
+                                            &person_keys,
+                                            tag_mask,
+                                        );
+                                        grow_limit = (pid_tab.len() * 7) / 10;
                                     }
                                     let h = mix64(ev.person);
                                     let tag = ((h >> 26) as u32) & tag_mask;
@@ -3127,32 +3318,21 @@ fn main() {
                                 let slice: &[ValidEvent] = slice;
                                 for (j, &ev) in slice.iter().enumerate() {
                                     if let Some(nx) = slice.get(j + DEDUP_PF) {
-                                        if (nx.person >> 63) == 0 {
-                                            prefetch(unsafe {
-                                                pid_tab
-                                                    .as_ptr()
-                                                    .add((mix64(nx.person) as usize) & mask)
-                                            });
-                                        } else {
-                                            prefetch_pack64(nx.person, person_arenas);
-                                        }
+                                        prefetch(unsafe {
+                                            pid_tab
+                                                .as_ptr()
+                                                .add((mix64(nx.person) as usize) & mask)
+                                        });
                                     }
-                                    if (person_keys.len() + 1) * 10 >= pid_tab.len() * 7 {
-                                        let nc = pid_tab.len() * 2;
-                                        pid_tab.clear();
-                                        pid_tab.resize(nc, 0);
-                                        mask = nc - 1;
-                                        for (i, &pk) in person_keys.iter().enumerate() {
-                                            let h = hash_pack64(pk, person_arenas);
-                                            let tag = ((h >> 26) as u32) & tag_mask;
-                                            let mut p = (h as usize) & mask;
-                                            while pid_tab[p] != 0 {
-                                                p = (p + 1) & mask;
-                                            }
-                                            pid_tab[p] = tag | ((i as u32) + 1);
-                                        }
+                                    if person_keys.len() >= grow_limit {
+                                        mask = grow_pid_tab_inline(
+                                            &mut pid_tab,
+                                            &person_keys,
+                                            tag_mask,
+                                        );
+                                        grow_limit = (pid_tab.len() * 7) / 10;
                                     }
-                                    let h = hash_pack64(ev.person, person_arenas);
+                                    let h = mix64(ev.person);
                                     let tag = ((h >> 26) as u32) & tag_mask;
                                     let mut pos = (h as usize) & mask;
                                     let pid = loop {
@@ -3168,11 +3348,9 @@ fn main() {
                                         }
                                         if (e & tag_mask) == tag {
                                             let id = ((e & id_mask) - 1) as usize;
-                                            if eq_pack64(
-                                                unsafe { *person_keys.get_unchecked(id) },
-                                                ev.person,
-                                                person_arenas,
-                                            ) {
+                                            if unsafe { *person_keys.get_unchecked(id) }
+                                                == ev.person
+                                            {
                                                 unsafe {
                                                     *ev_counts.get_unchecked_mut(id) += 1;
                                                 }
@@ -3185,44 +3363,137 @@ fn main() {
                                 }
                             }
                         }
-
-                        let num_persons = person_keys.len();
-                        ev_offsets.clear();
-                        ev_offsets.reserve(num_persons + 1);
-                        let mut sum = 0u32;
-                        for &c in &ev_counts {
-                            ev_offsets.push(sum);
-                            sum += c;
-                        }
-                        ev_offsets.push(sum);
-
-                        ev_cursor.clear();
-                        ev_cursor.extend_from_slice(&ev_offsets[..num_persons]);
-                        grouped_ev.resize(ev_total, 0);
-
-                        let mut ei = 0usize;
+                    } else {
                         for slice in shard_segs(ev_person_slots, ps) {
                             let slice: &[ValidEvent] = slice;
-                            for &ev in slice {
-                                let pid = unsafe { *ev_pids.get_unchecked(ei) } as usize;
-                                ei += 1;
-                                let dst = unsafe {
-                                    let cur = ev_cursor.get_unchecked_mut(pid);
-                                    let d = *cur as usize;
-                                    *cur += 1;
-                                    d
-                                };
-                                unsafe {
-                                    *grouped_ev.get_unchecked_mut(dst) =
-                                        ((ev.ts_off as u64) << 32) | (ev.price_cat as u64);
+                            for (j, &ev) in slice.iter().enumerate() {
+                                if let Some(nx) = slice.get(j + DEDUP_PF) {
+                                    if (nx.person >> 63) != 0 {
+                                        prefetch_pack64(nx.person, person_arenas);
+                                    } else if pid_tab.len() > 16_384 {
+                                        prefetch(unsafe {
+                                            pid_tab
+                                                .as_ptr()
+                                                .add((mix64(nx.person) as usize) & mask)
+                                        });
+                                    }
                                 }
+                                if person_keys.len() >= grow_limit {
+                                    mask = grow_pid_tab_general(
+                                        &mut pid_tab,
+                                        &person_keys,
+                                        person_arenas,
+                                        tag_mask,
+                                    );
+                                    grow_limit = (pid_tab.len() * 7) / 10;
+                                }
+                                let h = hash_pack64(ev.person, person_arenas);
+                                let tag = ((h >> 26) as u32) & tag_mask;
+                                let mut pos = (h as usize) & mask;
+                                let pid = loop {
+                                    let e = unsafe { *pid_tab.get_unchecked(pos) };
+                                    if e == 0 {
+                                        let id = person_keys.len() as u32;
+                                        person_keys.push(ev.person);
+                                        ev_counts.push(1);
+                                        unsafe {
+                                            *pid_tab.get_unchecked_mut(pos) = tag | (id + 1);
+                                        }
+                                        break id;
+                                    }
+                                    if (e & tag_mask) == tag {
+                                        let id = ((e & id_mask) - 1) as usize;
+                                        if eq_pack64(
+                                            unsafe { *person_keys.get_unchecked(id) },
+                                            ev.person,
+                                            person_arenas,
+                                        ) {
+                                            unsafe {
+                                                *ev_counts.get_unchecked_mut(id) += 1;
+                                            }
+                                            break id as u32;
+                                        }
+                                    }
+                                    pos = (pos + 1) & mask;
+                                };
+                                ev_pids.push(pid);
                             }
                         }
+                    }
 
-                        cl_counts.clear();
-                        cl_counts.resize(num_persons, 0);
-                        matched_cl.clear();
-                        if all_person_inline {
+                    let num_persons = person_keys.len();
+                    ev_offsets.clear();
+                    ev_offsets.reserve(num_persons + 1);
+                    let mut sum = 0u32;
+                    for &c in &ev_counts {
+                        ev_offsets.push(sum);
+                        sum += c;
+                    }
+                    ev_offsets.push(sum);
+
+                    ev_cursor.clear();
+                    ev_cursor.extend_from_slice(&ev_offsets[..num_persons]);
+                    grouped_ev.resize(ev_total, 0);
+
+                    let mut ei = 0usize;
+                    for slice in shard_segs(ev_person_slots, ps) {
+                        let slice: &[ValidEvent] = slice;
+                        for &ev in slice {
+                            let pid = unsafe { *ev_pids.get_unchecked(ei) } as usize;
+                            ei += 1;
+                            let dst = unsafe {
+                                let cur = ev_cursor.get_unchecked_mut(pid);
+                                let d = *cur as usize;
+                                *cur += 1;
+                                d
+                            };
+                            unsafe {
+                                *grouped_ev.get_unchecked_mut(dst) =
+                                    ((ev.ts_off as u64) << 32) | (ev.price_cat as u64);
+                            }
+                        }
+                    }
+
+                    cl_counts.clear();
+                    cl_counts.resize(num_persons, 0);
+                    matched_cl.clear();
+                    if all_persons_inline {
+                        if pid_tab.len() <= 16_384 {
+                            for slice in shard_segs(cl_person_slots, ps) {
+                                let slice: &[ValidClick] = slice;
+                                for &cl in slice {
+                                    let h = mix64(cl.person);
+                                    let tag = ((h >> 26) as u32) & tag_mask;
+                                    let mut pos = (h as usize) & mask;
+                                    loop {
+                                        let e = unsafe { *pid_tab.get_unchecked(pos) };
+                                        if e == 0 {
+                                            break;
+                                        }
+                                        if (e & tag_mask) == tag {
+                                            let id = ((e & id_mask) - 1) as usize;
+                                            if unsafe { *person_keys.get_unchecked(id) }
+                                                == cl.person
+                                            {
+                                                unsafe {
+                                                    *cl_counts.get_unchecked_mut(id) += 1;
+                                                }
+                                                matched_cl.push((
+                                                    id as u32,
+                                                    ClickPacked {
+                                                        ts_off: cl.ts_off,
+                                                        campaign_idx: cl.campaign_idx,
+                                                        cid: cl.cid,
+                                                    },
+                                                ));
+                                                break;
+                                            }
+                                        }
+                                        pos = (pos + 1) & mask;
+                                    }
+                                }
+                            }
+                        } else {
                             for slice in shard_segs(cl_person_slots, ps) {
                                 let slice: &[ValidClick] = slice;
                                 for (j, &cl) in slice.iter().enumerate() {
@@ -3264,497 +3535,548 @@ fn main() {
                                     }
                                 }
                             }
-                        } else {
-                            for slice in shard_segs(cl_person_slots, ps) {
-                                let slice: &[ValidClick] = slice;
-                                for (j, &cl) in slice.iter().enumerate() {
-                                    if let Some(nx) = slice.get(j + DEDUP_PF) {
-                                        if (nx.person >> 63) == 0 {
-                                            prefetch(unsafe {
-                                                pid_tab
-                                                    .as_ptr()
-                                                    .add((mix64(nx.person) as usize) & mask)
-                                            });
-                                        } else {
-                                            prefetch_pack64(nx.person, person_arenas);
-                                        }
-                                    }
-                                    let h = hash_pack64(cl.person, person_arenas);
-                                    let tag = ((h >> 26) as u32) & tag_mask;
-                                    let mut pos = (h as usize) & mask;
-                                    loop {
-                                        let e = unsafe { *pid_tab.get_unchecked(pos) };
-                                        if e == 0 {
-                                            break;
-                                        }
-                                        if (e & tag_mask) == tag {
-                                            let id = ((e & id_mask) - 1) as usize;
-                                            if eq_pack64(
-                                                unsafe { *person_keys.get_unchecked(id) },
-                                                cl.person,
-                                                person_arenas,
-                                            ) {
-                                                unsafe {
-                                                    *cl_counts.get_unchecked_mut(id) += 1;
-                                                }
-                                                matched_cl.push((
-                                                    id as u32,
-                                                    ClickPacked {
-                                                        ts_off: cl.ts_off,
-                                                        campaign_idx: cl.campaign_idx,
-                                                        cid: cl.cid,
-                                                    },
-                                                ));
-                                                break;
-                                            }
-                                        }
-                                        pos = (pos + 1) & mask;
-                                    }
-                                }
-                            }
                         }
-
-                        cl_offsets.clear();
-                        cl_offsets.reserve(num_persons + 1);
-                        let mut csum = 0u32;
-                        for &c in &cl_counts {
-                            cl_offsets.push(csum);
-                            csum += c;
-                        }
-                        cl_offsets.push(csum);
-                        cl_cursor.clear();
-                        cl_cursor.extend_from_slice(&cl_offsets[..num_persons]);
-                        grouped_cl.resize(
-                            matched_cl.len(),
-                            ClickPacked {
-                                ts_off: 0,
-                                campaign_idx: 0,
-                                cid: 0,
-                            },
-                        );
-                        for &(pid, cp) in &matched_cl {
-                            let dst = unsafe {
-                                let cur = cl_cursor.get_unchecked_mut(pid as usize);
-                                let d = *cur as usize;
-                                *cur += 1;
-                                d
-                            };
-                            unsafe { *grouped_cl.get_unchecked_mut(dst) = cp };
-                        }
-
-                        let t1 = if let Some(t0) = t0 {
-                            my_group_ns += t0.elapsed().as_nanos() as u64;
-                            Some(std::time::Instant::now())
-                        } else {
-                            None
-                        };
-
-                        for pid in 0..num_persons {
-                            let es = unsafe { *ev_offsets.get_unchecked(pid) } as usize;
-                            let ee = unsafe { *ev_offsets.get_unchecked(pid + 1) } as usize;
-                            let p_events = &mut grouped_ev[es..ee];
-                            sort_packed_events(p_events);
-
-                            let cs = unsafe { *cl_offsets.get_unchecked(pid) } as usize;
-                            let ce = unsafe { *cl_offsets.get_unchecked(pid + 1) } as usize;
-                            let p_clicks = &mut grouped_cl[cs..ce];
-                            let has_clicks = !p_clicks.is_empty();
-                            if has_clicks {
-                                sort_packed_clicks(p_clicks, cid_arenas);
-                                for &c in &active_camps {
-                                    camp_counts[c as usize] = 0;
-                                }
-                                active_camps.clear();
-                            }
-
-                            let uid_bytes =
-                                pack64_bytes(person_keys[pid], &mut uid_scratch, person_arenas);
-                            let uid_inline_entry = if uid_bytes.len() <= 60 {
-                                let n = uid_bytes.len();
-                                uid_entry_buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
-                                uid_entry_buf[4..4 + n].copy_from_slice(uid_bytes);
-                                Some(&uid_entry_buf[..4 + n])
-                            } else {
-                                None
-                            };
-
-                            let mut left = 0usize;
-                            let mut right = 0usize;
-                            let mut cur_day = i32::MIN;
-                            let mut day_sessions = 0i32;
-                            let mut day_events = 0i32;
-                            let mut day_rev = 0i64;
-
-                            let mut flush_day = |day: i32,
-                                                 d_sess: i32,
-                                                 d_ev: i32,
-                                                 d_rev: i64,
-                                                 touched: &mut Vec<u8>,
-                                                 crev: &mut [i64]| {
-                                if let Some(entry) = uid_inline_entry {
-                                    append_small(&mut uid_plain, entry);
-                                } else {
-                                    push_plain_str(&mut uid_plain, uid_bytes);
-                                }
-                                day_col.push(day);
-                                sess_col.push(d_sess);
-                                ev_col.push(d_ev);
-                                rev_col.push(d_rev);
-
-                                let bit_idx = out_rows & 7;
-                                if bit_idx == 0 {
-                                    cat_def_bits.push(0);
-                                }
-                                if !touched.is_empty() {
-                                    *cat_def_bits.last_mut().unwrap() |= 1u8 << bit_idx;
-                                    let mut best_c = touched[0];
-                                    let mut best_r = crev[best_c as usize];
-                                    let mut best_rank = cat_rank[best_c as usize];
-                                    crev[best_c as usize] = 0;
-                                    for &c in &touched[1..] {
-                                        let r = crev[c as usize];
-                                        crev[c as usize] = 0;
-                                        let rank = cat_rank[c as usize];
-                                        if r > best_r || (r == best_r && rank < best_rank) {
-                                            best_r = r;
-                                            best_c = c;
-                                            best_rank = rank;
-                                        }
+                    } else {
+                        for slice in shard_segs(cl_person_slots, ps) {
+                            let slice: &[ValidClick] = slice;
+                            for (j, &cl) in slice.iter().enumerate() {
+                                if let Some(nx) = slice.get(j + DEDUP_PF) {
+                                    if (nx.person >> 63) != 0 {
+                                        prefetch_pack64(nx.person, person_arenas);
+                                    } else if pid_tab.len() > 16_384 {
+                                        prefetch(unsafe {
+                                            pid_tab
+                                                .as_ptr()
+                                                .add((mix64(nx.person) as usize) & mask)
+                                        });
                                     }
-                                    touched.clear();
-                                    push_plain_str(
-                                        &mut cat_plain,
-                                        categories[best_c as usize].as_bytes(),
-                                    );
                                 }
-                                out_rows += 1;
-                            };
-
-                            let mut k = 0usize;
-                            let ev_n = p_events.len();
-                            while k < ev_n {
-                                let sess_start_off =
-                                    (unsafe { *p_events.get_unchecked(k) } >> 32) as u32;
-                                let day_idx =
-                                    ((win_start_rem + (sess_start_off as u64)) / 86_400_000) as i32;
-                                let day = min_day + day_idx;
-
-                                if day != cur_day {
-                                    if cur_day != i32::MIN {
-                                        flush_day(
-                                            cur_day,
-                                            day_sessions,
-                                            day_events,
-                                            day_rev,
-                                            &mut touched_cats,
-                                            &mut cat_rev_arr,
-                                        );
-                                    }
-                                    cur_day = day;
-                                    day_sessions = 0;
-                                    day_events = 0;
-                                    day_rev = 0;
-                                }
-
-                                let mut sess_events = 0i32;
-                                let mut sess_rev = 0i64;
-                                let mut has_purchase = false;
-                                let mut prev_off = sess_start_off;
-
-                                while k < ev_n {
-                                    let packed = unsafe { *p_events.get_unchecked(k) };
-                                    let ev_off = (packed >> 32) as u32;
-                                    if ev_off - prev_off > SESSION_GAP_MS {
+                                let h = hash_pack64(cl.person, person_arenas);
+                                let tag = ((h >> 26) as u32) & tag_mask;
+                                let mut pos = (h as usize) & mask;
+                                loop {
+                                    let e = unsafe { *pid_tab.get_unchecked(pos) };
+                                    if e == 0 {
                                         break;
                                     }
-                                    prev_off = ev_off;
-                                    sess_events += 1;
-                                    let pc = packed as u32;
-                                    let price = (pc & 0x00FF_FFFF) as i64;
-                                    if price > 0 {
-                                        has_purchase = true;
-                                        sess_rev += price;
-                                        let cat = (pc >> 24) as usize;
-                                        if cat_rev_arr[cat] == 0 {
-                                            touched_cats.push(cat as u8);
-                                        }
-                                        cat_rev_arr[cat] += price;
-                                    }
-                                    k += 1;
-                                }
-                                day_sessions += 1;
-                                day_events += sess_events;
-                                day_rev += sess_rev;
-
-                                let day_off = (day_idx as usize) * num_campaigns;
-                                if !has_clicks {
-                                    let cr = unsafe { camp_flat.get_unchecked_mut(day_off) };
-                                    cr.sessions += 1;
-                                    if has_purchase {
-                                        cr.purchasing_sessions += 1;
-                                        cr.revenue_cents += sess_rev;
-                                    }
-                                } else {
-                                    let sess_cl_off = sess_start_off + ASSIST_WINDOW_U32;
-                                    while right < p_clicks.len()
-                                        && unsafe { p_clicks.get_unchecked(right).ts_off }
-                                            <= sess_cl_off
-                                    {
-                                        let c =
-                                            unsafe { p_clicks.get_unchecked(right).campaign_idx };
-                                        if camp_counts[c as usize] == 0 {
-                                            active_camps.push(c);
-                                        }
-                                        camp_counts[c as usize] += 1;
-                                        right += 1;
-                                    }
-                                    while left < right
-                                        && unsafe { p_clicks.get_unchecked(left).ts_off }
-                                            < sess_start_off
-                                    {
-                                        let c =
-                                            unsafe { p_clicks.get_unchecked(left).campaign_idx };
-                                        camp_counts[c as usize] -= 1;
-                                        left += 1;
-                                    }
-
-                                    let credited_camp = if left < right {
-                                        unsafe { p_clicks.get_unchecked(right - 1).campaign_idx }
-                                    } else {
-                                        0
-                                    };
-
-                                    let cr = unsafe {
-                                        camp_flat
-                                            .get_unchecked_mut(day_off + credited_camp as usize)
-                                    };
-                                    cr.sessions += 1;
-                                    if has_purchase {
-                                        cr.purchasing_sessions += 1;
-                                        cr.revenue_cents += sess_rev;
-                                    }
-                                    if left < right {
-                                        active_camps.retain(|&c| camp_counts[c as usize] > 0);
-                                        for &c in &active_camps {
+                                    if (e & tag_mask) == tag {
+                                        let id = ((e & id_mask) - 1) as usize;
+                                        if eq_pack64(
+                                            unsafe { *person_keys.get_unchecked(id) },
+                                            cl.person,
+                                            person_arenas,
+                                        ) {
                                             unsafe {
+                                                *cl_counts.get_unchecked_mut(id) += 1;
+                                            }
+                                            matched_cl.push((
+                                                id as u32,
+                                                ClickPacked {
+                                                    ts_off: cl.ts_off,
+                                                    campaign_idx: cl.campaign_idx,
+                                                    cid: cl.cid,
+                                                },
+                                            ));
+                                            break;
+                                        }
+                                    }
+                                    pos = (pos + 1) & mask;
+                                }
+                            }
+                        }
+                    }
+
+                    cl_offsets.clear();
+                    cl_offsets.reserve(num_persons + 1);
+                    let mut csum = 0u32;
+                    for &c in &cl_counts {
+                        cl_offsets.push(csum);
+                        csum += c;
+                    }
+                    cl_offsets.push(csum);
+                    cl_cursor.clear();
+                    cl_cursor.extend_from_slice(&cl_offsets[..num_persons]);
+                    grouped_cl.resize(
+                        matched_cl.len(),
+                        ClickPacked {
+                            ts_off: 0,
+                            campaign_idx: 0,
+                            cid: 0,
+                        },
+                    );
+                    for &(pid, cp) in &matched_cl {
+                        let dst = unsafe {
+                            let cur = cl_cursor.get_unchecked_mut(pid as usize);
+                            let d = *cur as usize;
+                            *cur += 1;
+                            d
+                        };
+                        unsafe { *grouped_cl.get_unchecked_mut(dst) = cp };
+                    }
+
+                    let t_s0 = if let Some(t0) = t_g0 {
+                        let now = std::time::Instant::now();
+                        group_ns += now.duration_since(t0).as_nanos() as u64;
+                        Some(now)
+                    } else {
+                        None
+                    };
+
+                    for pid in 0..num_persons {
+                        let es = unsafe { *ev_offsets.get_unchecked(pid) } as usize;
+                        let ee = unsafe { *ev_offsets.get_unchecked(pid + 1) } as usize;
+                        let p_events = &mut grouped_ev[es..ee];
+                        sort_packed_events(p_events);
+
+                        let cs = unsafe { *cl_offsets.get_unchecked(pid) } as usize;
+                        let ce = unsafe { *cl_offsets.get_unchecked(pid + 1) } as usize;
+                        let p_clicks = &mut grouped_cl[cs..ce];
+                        let has_clicks = !p_clicks.is_empty();
+                        if has_clicks {
+                            sort_packed_clicks(p_clicks, cid_arenas, all_cids_inline);
+                            for &c in &active_camps {
+                                camp_counts[c as usize] = 0;
+                            }
+                            active_camps.clear();
+                        }
+
+                        let pk = unsafe { *person_keys.get_unchecked(pid) };
+                        let uid_inline_entry: Option<&[u8]>;
+                        let mut uid_long_bytes: &[u8] = &[];
+                        if all_persons_inline || (pk >> 63) == 0 {
+                            let n = decode_inline(pk, &mut uid_entry_buf[4..14]);
+                            uid_entry_buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+                            uid_inline_entry = Some(&uid_entry_buf[..4 + n]);
+                        } else {
+                            let b = overflow_bytes(pk, person_arenas);
+                            if b.len() <= 60 {
+                                let n = b.len();
+                                uid_entry_buf[0..4].copy_from_slice(&(n as u32).to_le_bytes());
+                                uid_entry_buf[4..4 + n].copy_from_slice(b);
+                                uid_inline_entry = Some(&uid_entry_buf[..4 + n]);
+                            } else {
+                                uid_long_bytes = b;
+                                uid_inline_entry = None;
+                            }
+                        }
+
+                        let mut left = 0usize;
+                        let mut right = 0usize;
+                        let mut cur_day = i32::MIN;
+                        let mut day_sessions = 0i32;
+                        let mut day_events = 0i32;
+                        let mut day_rev = 0i64;
+                        let mut cached_day_idx = -1i32;
+                        let mut cached_day_end = 0u64;
+
+                        let mut flush_day = |day: i32,
+                                             d_sess: i32,
+                                             d_ev: i32,
+                                             d_rev: i64,
+                                             touched: &mut Vec<u8>,
+                                             crev: &mut [i64]| {
+                            if let Some(entry) = uid_inline_entry {
+                                append_small(&mut uid_plain, entry);
+                            } else {
+                                push_plain_str(&mut uid_plain, uid_long_bytes);
+                            }
+                            day_col.push(day);
+                            sess_col.push(d_sess);
+                            ev_col.push(d_ev);
+                            rev_col.push(d_rev);
+
+                            let bit_idx = out_rows & 7;
+                            if bit_idx == 0 {
+                                cat_def_bits.push(0);
+                            }
+                            if !touched.is_empty() {
+                                *cat_def_bits.last_mut().unwrap() |= 1u8 << bit_idx;
+                                let mut best_c = touched[0];
+                                let mut best_r = crev[best_c as usize];
+                                let mut best_rank = cat_rank[best_c as usize];
+                                crev[best_c as usize] = 0;
+                                for &c in &touched[1..] {
+                                    let r = crev[c as usize];
+                                    crev[c as usize] = 0;
+                                    let rank = cat_rank[c as usize];
+                                    if r > best_r || (r == best_r && rank < best_rank) {
+                                        best_r = r;
+                                        best_c = c;
+                                        best_rank = rank;
+                                    }
+                                }
+                                touched.clear();
+                                append_small(&mut cat_plain, &cat_plain_blobs[best_c as usize]);
+                            }
+                            out_rows += 1;
+                        };
+
+                        let mut k = 0usize;
+                        let ev_n = p_events.len();
+                        while k < ev_n {
+                            let sess_start_off =
+                                (unsafe { *p_events.get_unchecked(k) } >> 32) as u32;
+                            let off = win_start_rem + (sess_start_off as u64);
+                            if off >= cached_day_end {
+                                if cached_day_idx >= 0 && off < cached_day_end + 86_400_000 {
+                                    cached_day_idx += 1;
+                                    cached_day_end += 86_400_000;
+                                } else {
+                                    cached_day_idx = (off / 86_400_000) as i32;
+                                    cached_day_end = ((cached_day_idx as u64) + 1) * 86_400_000;
+                                }
+                            }
+                            let day_idx = cached_day_idx;
+                            let day = min_day + day_idx;
+
+                            if day != cur_day {
+                                if cur_day != i32::MIN {
+                                    flush_day(
+                                        cur_day,
+                                        day_sessions,
+                                        day_events,
+                                        day_rev,
+                                        &mut touched_cats,
+                                        &mut cat_rev_arr,
+                                    );
+                                }
+                                cur_day = day;
+                                day_sessions = 0;
+                                day_events = 0;
+                                day_rev = 0;
+                            }
+
+                            let mut sess_events = 0i32;
+                            let mut sess_rev = 0i64;
+                            let mut has_purchase = false;
+                            let mut prev_off = sess_start_off;
+
+                            while k < ev_n {
+                                let packed = unsafe { *p_events.get_unchecked(k) };
+                                let ev_off = (packed >> 32) as u32;
+                                if ev_off - prev_off > SESSION_GAP_MS {
+                                    break;
+                                }
+                                prev_off = ev_off;
+                                sess_events += 1;
+                                let pc = packed as u32;
+                                let price = (pc & 0x00FF_FFFF) as i64;
+                                if price > 0 {
+                                    has_purchase = true;
+                                    sess_rev += price;
+                                    let cat = (pc >> 24) as usize;
+                                    if cat_rev_arr[cat] == 0 {
+                                        touched_cats.push(cat as u8);
+                                    }
+                                    cat_rev_arr[cat] += price;
+                                }
+                                k += 1;
+                            }
+                            day_sessions += 1;
+                            day_events += sess_events;
+                            day_rev += sess_rev;
+
+                            let day_off = (day_idx as usize) * num_campaigns;
+                            if !has_clicks {
+                                let cr = unsafe { camp_flat.get_unchecked_mut(day_off) };
+                                cr.sessions += 1;
+                                if has_purchase {
+                                    cr.purchasing_sessions += 1;
+                                    cr.revenue_cents += sess_rev;
+                                }
+                            } else {
+                                let sess_cl_off = sess_start_off + ASSIST_WINDOW_U32;
+                                while right < p_clicks.len()
+                                    && unsafe { p_clicks.get_unchecked(right).ts_off }
+                                        <= sess_cl_off
+                                {
+                                    let c = unsafe { p_clicks.get_unchecked(right).campaign_idx };
+                                    if camp_counts[c as usize] == 0 {
+                                        active_camps.push(c);
+                                    }
+                                    camp_counts[c as usize] += 1;
+                                    right += 1;
+                                }
+                                while left < right
+                                    && unsafe { p_clicks.get_unchecked(left).ts_off }
+                                        < sess_start_off
+                                {
+                                    let c = unsafe { p_clicks.get_unchecked(left).campaign_idx };
+                                    camp_counts[c as usize] -= 1;
+                                    left += 1;
+                                }
+
+                                let credited_camp = if left < right {
+                                    unsafe { p_clicks.get_unchecked(right - 1).campaign_idx }
+                                } else {
+                                    0
+                                };
+
+                                let cr = unsafe {
+                                    camp_flat.get_unchecked_mut(day_off + credited_camp as usize)
+                                };
+                                cr.sessions += 1;
+                                if has_purchase {
+                                    cr.purchasing_sessions += 1;
+                                    cr.revenue_cents += sess_rev;
+                                }
+                                if left < right {
+                                    let mut w = 0usize;
+                                    for r in 0..active_camps.len() {
+                                        let c = unsafe { *active_camps.get_unchecked(r) };
+                                        if unsafe { *camp_counts.get_unchecked(c as usize) } > 0 {
+                                            unsafe {
+                                                *active_camps.get_unchecked_mut(w) = c;
                                                 camp_flat
                                                     .get_unchecked_mut(day_off + c as usize)
                                                     .assisted_sessions += 1;
                                             }
+                                            w += 1;
                                         }
-                                    } else {
-                                        active_camps.clear();
                                     }
+                                    active_camps.truncate(w);
+                                } else {
+                                    active_camps.clear();
                                 }
                             }
-
-                            if cur_day != i32::MIN {
-                                flush_day(
-                                    cur_day,
-                                    day_sessions,
-                                    day_events,
-                                    day_rev,
-                                    &mut touched_cats,
-                                    &mut cat_rev_arr,
-                                );
-                            }
                         }
 
-                        if let Some(t1) = t1 {
-                            my_sess_ns += t1.elapsed().as_nanos() as u64;
+                        if cur_day != i32::MIN {
+                            flush_day(
+                                cur_day,
+                                day_sessions,
+                                day_events,
+                                day_rev,
+                                &mut touched_cats,
+                                &mut cat_rev_arr,
+                            );
                         }
                     }
 
-                    let tw = if trace {
-                        Some(std::time::Instant::now())
-                    } else {
-                        None
-                    };
-                    if out_rows > 0 || tid == 0 {
-                        let cols = [
-                            ColSpec {
-                                name: "user_id",
-                                kind: ColKind::Utf8Req,
-                                plain: &uid_plain,
-                                def_bits: None,
-                            },
-                            ColSpec {
-                                name: "day",
-                                kind: ColKind::Date32,
-                                plain: slice_as_bytes(&day_col),
-                                def_bits: None,
-                            },
-                            ColSpec {
-                                name: "sessions",
-                                kind: ColKind::Int32,
-                                plain: slice_as_bytes(&sess_col),
-                                def_bits: None,
-                            },
-                            ColSpec {
-                                name: "events",
-                                kind: ColKind::Int32,
-                                plain: slice_as_bytes(&ev_col),
-                                def_bits: None,
-                            },
-                            ColSpec {
-                                name: "revenue_cents",
-                                kind: ColKind::Int64,
-                                plain: slice_as_bytes(&rev_col),
-                                def_bits: None,
-                            },
-                            ColSpec {
-                                name: "top_category",
-                                kind: ColKind::Utf8Opt,
-                                plain: &cat_plain,
-                                def_bits: Some(&cat_def_bits),
-                            },
-                        ];
-                        write_parquet_file(
-                            &out_dir.join(format!("user_daily/part-{tid}.parquet")),
-                            out_rows,
-                            &cols,
+                    if let Some(t0) = t_s0 {
+                        sess_ns += t0.elapsed().as_nanos() as u64;
+                    }
+                }
+
+                let t_p0 = if trace {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+
+                if out_rows > 0 || tid == 0 {
+                    let cols = [
+                        ColSpec {
+                            name: "user_id",
+                            kind: ColKind::Utf8Req,
+                            plain: &uid_plain,
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "day",
+                            kind: ColKind::Date32,
+                            plain: slice_as_bytes(&day_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "sessions",
+                            kind: ColKind::Int32,
+                            plain: slice_as_bytes(&sess_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "events",
+                            kind: ColKind::Int32,
+                            plain: slice_as_bytes(&ev_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "revenue_cents",
+                            kind: ColKind::Int64,
+                            plain: slice_as_bytes(&rev_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "top_category",
+                            kind: ColKind::Utf8Opt,
+                            plain: &cat_plain,
+                            def_bits: Some(&cat_def_bits),
+                        },
+                    ];
+                    write_parquet_file(
+                        &out_dir.join(format!("user_daily/part-{tid}.parquet")),
+                        out_rows,
+                        &cols,
+                    );
+                }
+
+                let parquet_ns = t_p0.map(|t| t.elapsed().as_nanos() as u64).unwrap_or(0);
+
+                unsafe {
+                    worker_res_slots[tid].set(WorkerResult {
+                        camp_flat,
+                        init_ns,
+                        group_ns,
+                        sess_ns,
+                        parquet_ns,
+                    });
+                }
+
+                std::mem::forget(uid_plain);
+                std::mem::forget(day_col);
+                std::mem::forget(sess_col);
+                std::mem::forget(ev_col);
+                std::mem::forget(rev_col);
+                std::mem::forget(cat_def_bits);
+                std::mem::forget(cat_plain);
+                std::mem::forget(pid_tab);
+                std::mem::forget(person_keys);
+                std::mem::forget(ev_pids);
+                std::mem::forget(grouped_ev);
+                std::mem::forget(grouped_cl);
+
+                barrier.wait();
+
+                if tid == 0 {
+                    if trace {
+                        let f = ncpu as f64 * 1e6;
+                        let avg_i = (0..ncpu)
+                            .map(|t| unsafe { worker_res_slots[t].get().init_ns })
+                            .sum::<u64>() as f64
+                            / f;
+                        let avg_g = (0..ncpu)
+                            .map(|t| unsafe { worker_res_slots[t].get().group_ns })
+                            .sum::<u64>() as f64
+                            / f;
+                        let avg_s = (0..ncpu)
+                            .map(|t| unsafe { worker_res_slots[t].get().sess_ns })
+                            .sum::<u64>() as f64
+                            / f;
+                        let avg_p = (0..ncpu)
+                            .map(|t| unsafe { worker_res_slots[t].get().parquet_ns })
+                            .sum::<u64>() as f64
+                            / f;
+                        let max_t = (0..ncpu)
+                            .map(|t| {
+                                let r = unsafe { worker_res_slots[t].get() };
+                                r.init_ns + r.group_ns + r.sess_ns + r.parquet_ns
+                            })
+                            .max()
+                            .unwrap_or(0) as f64
+                            / 1e6;
+                        eprintln!(
+                            "[{:7.3} s] wave 3 done (avg/thread: init={avg_i:.1}ms, group={avg_g:.1}ms, sess={avg_s:.1}ms, parquet={avg_p:.1}ms; max_thread={max_t:.1}ms)",
+                            t_start.elapsed().as_secs_f64()
                         );
                     }
-                    if let Some(tw) = tw {
-                        w3_group_ns.fetch_add(my_group_ns, AtomicOrd::Relaxed);
-                        w3_sess_ns.fetch_add(my_sess_ns, AtomicOrd::Relaxed);
-                        w3_write_ns.fetch_add(tw.elapsed().as_nanos() as u64, AtomicOrd::Relaxed);
+
+                    let camp_names = &camp_dims.camp_names;
+                    let camp_channels = &camp_dims.camp_channels;
+                    let mut merged = unsafe { worker_res_slots[0].take().camp_flat };
+                    for t in 1..ncpu {
+                        let flat = unsafe { &worker_res_slots[t].get().camp_flat };
+                        for i in 0..flat_camp_len {
+                            let v = unsafe { *flat.get_unchecked(i) };
+                            if v.sessions != 0 || v.assisted_sessions != 0 {
+                                let m = unsafe { merged.get_unchecked_mut(i) };
+                                m.sessions += v.sessions;
+                                m.purchasing_sessions += v.purchasing_sessions;
+                                m.revenue_cents += v.revenue_cents;
+                                m.assisted_sessions += v.assisted_sessions;
+                            }
+                        }
                     }
 
-                    std::mem::forget(uid_plain);
-                    std::mem::forget(day_col);
-                    std::mem::forget(sess_col);
-                    std::mem::forget(ev_col);
-                    std::mem::forget(rev_col);
-                    std::mem::forget(cat_def_bits);
-                    std::mem::forget(cat_plain);
-                    std::mem::forget(pid_tab);
-                    std::mem::forget(person_keys);
-                    std::mem::forget(grouped_ev);
-                    std::mem::forget(grouped_cl);
+                    let mut camp_rows = 0usize;
+                    let mut cid_plain = Vec::with_capacity(1 << 18);
+                    let mut ch_plain = Vec::with_capacity(1 << 18);
+                    let mut cday_col: Vec<i32> = Vec::with_capacity(1 << 15);
+                    let mut csess_col: Vec<i32> = Vec::with_capacity(1 << 15);
+                    let mut cpsess_col: Vec<i32> = Vec::with_capacity(1 << 15);
+                    let mut crev_col: Vec<i64> = Vec::with_capacity(1 << 15);
+                    let mut cass_col: Vec<i32> = Vec::with_capacity(1 << 15);
 
-                    camp_flat
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                    for d in 0..num_days {
+                        let day = min_day + (d as i32);
+                        let base = d * num_campaigns;
+                        for c in 0..num_campaigns {
+                            let v = unsafe { *merged.get_unchecked(base + c) };
+                            if v.sessions != 0 || v.assisted_sessions != 0 {
+                                push_plain_str(&mut cid_plain, camp_names[c].as_bytes());
+                                push_plain_str(&mut ch_plain, camp_channels[c].as_bytes());
+                                cday_col.push(day);
+                                csess_col.push(v.sessions);
+                                cpsess_col.push(v.purchasing_sessions);
+                                crev_col.push(v.revenue_cents);
+                                cass_col.push(v.assisted_sessions);
+                                camp_rows += 1;
+                            }
+                        }
+                    }
+
+                    let camp_cols = [
+                        ColSpec {
+                            name: "campaign_id",
+                            kind: ColKind::Utf8Req,
+                            plain: &cid_plain,
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "channel",
+                            kind: ColKind::Utf8Req,
+                            plain: &ch_plain,
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "day",
+                            kind: ColKind::Date32,
+                            plain: slice_as_bytes(&cday_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "sessions",
+                            kind: ColKind::Int32,
+                            plain: slice_as_bytes(&csess_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "purchasing_sessions",
+                            kind: ColKind::Int32,
+                            plain: slice_as_bytes(&cpsess_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "revenue_cents",
+                            kind: ColKind::Int64,
+                            plain: slice_as_bytes(&crev_col),
+                            def_bits: None,
+                        },
+                        ColSpec {
+                            name: "assisted_sessions",
+                            kind: ColKind::Int32,
+                            plain: slice_as_bytes(&cass_col),
+                            def_bits: None,
+                        },
+                    ];
+                    write_parquet_file(
+                        &out_dir.join("campaign_daily/part-0.parquet"),
+                        camp_rows,
+                        &camp_cols,
+                    );
+
+                    if trace {
+                        eprintln!(
+                            "[{:7.3} s] all output written",
+                            t_start.elapsed().as_secs_f64()
+                        );
+                    }
+                    std::process::exit(0);
+                }
+
+                barrier.wait();
+            });
+        }
     });
-
-    if trace {
-        let g = w3_group_ns.load(AtomicOrd::Relaxed) as f64 / (ncpu as f64 * 1e6);
-        let se = w3_sess_ns.load(AtomicOrd::Relaxed) as f64 / (ncpu as f64 * 1e6);
-        let wr = w3_write_ns.load(AtomicOrd::Relaxed) as f64 / (ncpu as f64 * 1e6);
-        eprintln!(
-            "[{:7.3} s] wave 3 done (avg/thread: group={:.1}ms, sess={:.1}ms, parquet={:.1}ms)",
-            t_start.elapsed().as_secs_f64(),
-            g,
-            se,
-            wr
-        );
-    }
-
-    // Merge campaign_daily and write campaign_daily/part-0.parquet
-    let dims = dims_cell.get().unwrap();
-    let num_campaigns = dims.camp_names.len();
-    let flat_camp_len = num_days * num_campaigns;
-
-    let mut merged = vec![CampaignDayAgg::default(); flat_camp_len];
-    for flat in &camp_results {
-        for i in 0..flat_camp_len {
-            let v = flat[i];
-            if v.sessions != 0 || v.assisted_sessions != 0 {
-                merged[i].sessions += v.sessions;
-                merged[i].purchasing_sessions += v.purchasing_sessions;
-                merged[i].revenue_cents += v.revenue_cents;
-                merged[i].assisted_sessions += v.assisted_sessions;
-            }
-        }
-    }
-
-    let mut camp_rows = 0usize;
-    let mut cid_plain = Vec::with_capacity(1 << 18);
-    let mut ch_plain = Vec::with_capacity(1 << 18);
-    let mut cday_col: Vec<i32> = Vec::with_capacity(1 << 15);
-    let mut csess_col: Vec<i32> = Vec::with_capacity(1 << 15);
-    let mut cpsess_col: Vec<i32> = Vec::with_capacity(1 << 15);
-    let mut crev_col: Vec<i64> = Vec::with_capacity(1 << 15);
-    let mut cass_col: Vec<i32> = Vec::with_capacity(1 << 15);
-
-    for d in 0..num_days {
-        let day = min_day + (d as i32);
-        let base = d * num_campaigns;
-        for c in 0..num_campaigns {
-            let v = merged[base + c];
-            if v.sessions != 0 || v.assisted_sessions != 0 {
-                push_plain_str(&mut cid_plain, dims.camp_names[c].as_bytes());
-                push_plain_str(&mut ch_plain, dims.camp_channels[c].as_bytes());
-                cday_col.push(day);
-                csess_col.push(v.sessions);
-                cpsess_col.push(v.purchasing_sessions);
-                crev_col.push(v.revenue_cents);
-                cass_col.push(v.assisted_sessions);
-                camp_rows += 1;
-            }
-        }
-    }
-
-    let camp_cols = [
-        ColSpec {
-            name: "campaign_id",
-            kind: ColKind::Utf8Req,
-            plain: &cid_plain,
-            def_bits: None,
-        },
-        ColSpec {
-            name: "channel",
-            kind: ColKind::Utf8Req,
-            plain: &ch_plain,
-            def_bits: None,
-        },
-        ColSpec {
-            name: "day",
-            kind: ColKind::Date32,
-            plain: slice_as_bytes(&cday_col),
-            def_bits: None,
-        },
-        ColSpec {
-            name: "sessions",
-            kind: ColKind::Int32,
-            plain: slice_as_bytes(&csess_col),
-            def_bits: None,
-        },
-        ColSpec {
-            name: "purchasing_sessions",
-            kind: ColKind::Int32,
-            plain: slice_as_bytes(&cpsess_col),
-            def_bits: None,
-        },
-        ColSpec {
-            name: "revenue_cents",
-            kind: ColKind::Int64,
-            plain: slice_as_bytes(&crev_col),
-            def_bits: None,
-        },
-        ColSpec {
-            name: "assisted_sessions",
-            kind: ColKind::Int32,
-            plain: slice_as_bytes(&cass_col),
-            def_bits: None,
-        },
-    ];
-    write_parquet_file(
-        &out_dir.join("campaign_daily/part-0.parquet"),
-        camp_rows,
-        &camp_cols,
-    );
-
-    if trace {
-        eprintln!(
-            "[{:7.3} s] all output written",
-            t_start.elapsed().as_secs_f64()
-        );
-    }
-    std::process::exit(0);
 }
 
 fn dedup_event_shard(
@@ -3762,6 +4084,7 @@ fn dedup_event_shard(
     sh: usize,
     n: usize,
     eid_arenas: &[Vec<u8>],
+    all_eids_inline: bool,
     tab32: &mut Vec<u32>,
     tab64: &mut Vec<u64>,
     unique_ev: &mut Vec<RawEvent>,
@@ -3776,36 +4099,105 @@ fn dedup_event_shard(
     if n < 1_000_000 {
         tab32.clear();
         tab32.resize(cap, 0);
-        for slice in shard_segs(raw_ev_slots, sh) {
-            let slice: &[RawEvent] = slice;
-            for (j, &ev) in slice.iter().enumerate() {
-                if let Some(nx) = slice.get(j + DEDUP_PF) {
-                    prefetch(unsafe { tab32.as_ptr().add((nx.eid_h as usize) & mask) });
-                }
-                let h = ev.eid_h as u64;
-                let tag = ((h >> 20) as u32) & 0xFFF;
-                let mut pos = (h as usize) & mask;
-                loop {
-                    let e = unsafe { *tab32.get_unchecked(pos) };
-                    if e == 0 {
-                        let idx = unique_ev.len() as u32;
-                        unique_ev.push(ev);
-                        unsafe {
-                            *tab32.get_unchecked_mut(pos) = (tag << 20) | (idx + 1);
+        if all_eids_inline {
+            if cap <= 16_384 {
+                for slice in shard_segs(raw_ev_slots, sh) {
+                    let slice: &[RawEvent] = slice;
+                    for &ev in slice {
+                        let h = ev.eid_h as u64;
+                        let tag = ((h >> 20) as u32) & 0xFFF;
+                        let mut pos = (h as usize) & mask;
+                        loop {
+                            let e = unsafe { *tab32.get_unchecked(pos) };
+                            if e == 0 {
+                                let idx = unique_ev.len() as u32;
+                                unique_ev.push(ev);
+                                unsafe {
+                                    *tab32.get_unchecked_mut(pos) = (tag << 20) | (idx + 1);
+                                }
+                                break;
+                            }
+                            if (e >> 20) == tag {
+                                let idx = ((e & 0xF_FFFF) - 1) as usize;
+                                let ex = unsafe { unique_ev.get_unchecked_mut(idx) };
+                                if ex.eid == ev.eid {
+                                    if ev.ingest_s < ex.ingest_s {
+                                        *ex = ev;
+                                    }
+                                    break;
+                                }
+                            }
+                            pos = (pos + 1) & mask;
                         }
-                        break;
                     }
-                    if (e >> 20) == tag {
-                        let idx = ((e & 0xF_FFFF) - 1) as usize;
-                        let ex = unsafe { unique_ev.get_unchecked_mut(idx) };
-                        if eq_pack64(ex.eid, ev.eid, eid_arenas) {
-                            if ev.ingest_s < ex.ingest_s {
-                                *ex = ev;
+                }
+            } else {
+                for slice in shard_segs(raw_ev_slots, sh) {
+                    let slice: &[RawEvent] = slice;
+                    for (j, &ev) in slice.iter().enumerate() {
+                        if let Some(nx) = slice.get(j + DEDUP_PF) {
+                            prefetch(unsafe { tab32.as_ptr().add((nx.eid_h as usize) & mask) });
+                        }
+                        let h = ev.eid_h as u64;
+                        let tag = ((h >> 20) as u32) & 0xFFF;
+                        let mut pos = (h as usize) & mask;
+                        loop {
+                            let e = unsafe { *tab32.get_unchecked(pos) };
+                            if e == 0 {
+                                let idx = unique_ev.len() as u32;
+                                unique_ev.push(ev);
+                                unsafe {
+                                    *tab32.get_unchecked_mut(pos) = (tag << 20) | (idx + 1);
+                                }
+                                break;
+                            }
+                            if (e >> 20) == tag {
+                                let idx = ((e & 0xF_FFFF) - 1) as usize;
+                                let ex = unsafe { unique_ev.get_unchecked_mut(idx) };
+                                if ex.eid == ev.eid {
+                                    if ev.ingest_s < ex.ingest_s {
+                                        *ex = ev;
+                                    }
+                                    break;
+                                }
+                            }
+                            pos = (pos + 1) & mask;
+                        }
+                    }
+                }
+            }
+        } else {
+            for slice in shard_segs(raw_ev_slots, sh) {
+                let slice: &[RawEvent] = slice;
+                for (j, &ev) in slice.iter().enumerate() {
+                    if let Some(nx) = slice.get(j + DEDUP_PF) {
+                        prefetch(unsafe { tab32.as_ptr().add((nx.eid_h as usize) & mask) });
+                    }
+                    let h = ev.eid_h as u64;
+                    let tag = ((h >> 20) as u32) & 0xFFF;
+                    let mut pos = (h as usize) & mask;
+                    loop {
+                        let e = unsafe { *tab32.get_unchecked(pos) };
+                        if e == 0 {
+                            let idx = unique_ev.len() as u32;
+                            unique_ev.push(ev);
+                            unsafe {
+                                *tab32.get_unchecked_mut(pos) = (tag << 20) | (idx + 1);
                             }
                             break;
                         }
+                        if (e >> 20) == tag {
+                            let idx = ((e & 0xF_FFFF) - 1) as usize;
+                            let ex = unsafe { unique_ev.get_unchecked_mut(idx) };
+                            if eq_pack64(ex.eid, ev.eid, eid_arenas) {
+                                if ev.ingest_s < ex.ingest_s {
+                                    *ex = ev;
+                                }
+                                break;
+                            }
+                        }
+                        pos = (pos + 1) & mask;
                     }
-                    pos = (pos + 1) & mask;
                 }
             }
         }
