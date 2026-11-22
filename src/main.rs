@@ -16,8 +16,6 @@ const ASSIST_WINDOW_U32: u32 = (7 * MS_PER_DAY) as u32;
 const DEDUP_SHARDS: usize = 128;
 const PERSON_SHARDS: usize = 64;
 const CHUNK_SIZE: usize = 2 * 1024 * 1024;
-const BLOOM_BITS: usize = 1 << 21; // 256 KB (L2-resident)
-const BLOOM_MASK: usize = BLOOM_BITS - 1;
 
 // ============================================================================
 // Zero-copy mmap (never unmapped; reclaimed instantaneously on exit(0))
@@ -178,6 +176,11 @@ fn pack64_bytes<'a>(v: u64, scratch: &'a mut [u8; 10], arenas: &'a [Vec<u8>]) ->
 
 #[inline(always)]
 fn eq_pack64(a: u64, b: u64, arenas: &[Vec<u8>]) -> bool {
+    // Identical values are always the same string (inline, or the same arena
+    // bytes), which skips the byte compare for linked persons' shared root.
+    if a == b {
+        return true;
+    }
     if ((a | b) >> 63) == 0 {
         a == b
     } else if (a >> 63) != (b >> 63) {
@@ -374,46 +377,74 @@ fn has_byte_mask_swar(word: u64, byte: u8) -> u64 {
     non_zero ^ 0x8080_8080_8080_8080
 }
 
+/// Splits a line into its F = N + 1 fields using the comma offsets from the
+/// scanner, and strips quotes. `q` is the number of `"` bytes in the line, also
+/// from the scanner. A field is valid if it has no quotes, or is wrapped in a
+/// pair of quotes (len >= 2) with none inside. Each wrapped field accounts for
+/// exactly 2 quotes, so the line is valid iff the wrapped fields account for
+/// all `q` quotes. Same result as unquoting every field and rejecting stray
+/// quotes, without rescanning the fields.
 #[inline(always)]
-fn has_quote_fast(b: &[u8]) -> bool {
-    let len = b.len();
-    let mut i = 0;
-    while i + 8 <= len {
-        let w = u64::from_le_bytes(unsafe { *(b.as_ptr().add(i) as *const [u8; 8]) });
-        if has_byte_mask_swar(w, b'"') != 0 {
-            return true;
-        }
-        i += 8;
-    }
-    while i < len {
-        if unsafe { *b.get_unchecked(i) } == b'"' {
-            return true;
-        }
+fn split_fields<'a, const N: usize, const F: usize>(
+    line: &'a [u8],
+    c: &[usize; N],
+    q: u32,
+) -> Option<[&'a [u8]; F]> {
+    debug_assert!(F == N + 1);
+    let empty: &'a [u8] = &[];
+    let mut out: [&'a [u8]; F] = [empty; F];
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < F {
+        let end = if i < N { c[i] } else { line.len() };
+        out[i] = &line[start..end];
+        start = end + 1;
         i += 1;
     }
-    false
-}
-
-#[inline(always)]
-fn unquote(f: &[u8]) -> Option<&[u8]> {
-    let len = f.len();
-    if len >= 2
-        && unsafe { *f.get_unchecked(0) == b'"' && *f.get_unchecked(len - 1) == b'"' }
-    {
-        let inner = &f[1..len - 1];
-        if !has_quote_fast(inner) {
-            return Some(inner);
+    if q != 0 {
+        let mut explained = 0u32;
+        let mut i = 0usize;
+        while i < F {
+            let f = out[i];
+            let len = f.len();
+            if len >= 2 && f[0] == b'"' && f[len - 1] == b'"' {
+                out[i] = &f[1..len - 1];
+                explained += 2;
+            }
+            i += 1;
         }
-        return None;
+        if explained != q {
+            return None;
+        }
     }
-    if has_quote_fast(f) {
-        return None;
+    Some(out)
+}
+
+/// Software prefetch hint (no-op off x86-64). Never dereferences `p`.
+#[inline(always)]
+fn prefetch<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p as *const i8);
     }
-    Some(f)
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = p;
+}
+
+/// Prefetches the bytes of an overflow (arena) Pack64 value; nothing for inline ones.
+#[inline(always)]
+fn prefetch_pack64(v: u64, arenas: &[Vec<u8>]) {
+    if (v >> 63) != 0 {
+        let aid = ((v >> 55) & 0xFF) as usize;
+        let off = ((v >> 23) & 0xFFFF_FFFF) as usize;
+        if let Some(a) = arenas.get(aid) {
+            prefetch(a.as_ptr().wrapping_add(off));
+        }
+    }
 }
 
 #[inline(always)]
-fn scan_slice_scalar<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
+fn scan_slice_scalar<const N: usize, F: FnMut(&[u8], &[usize; N], usize, u32)>(
     buf: &[u8],
     mut on_line: F,
 ) {
@@ -421,7 +452,7 @@ fn scan_slice_scalar<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
     let mut line_start = 0usize;
     let mut commas = [0usize; N];
     let mut c_cnt = 0usize;
-    let mut has_q = false;
+    let mut q_cnt = 0u32;
     let mut i = 0usize;
 
     while i + 8 <= len {
@@ -442,12 +473,10 @@ fn scan_slice_scalar<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
                 c_cnt += 1;
                 cm_b &= cm_b - 1;
             }
-            if (qt & before) != 0 {
-                has_q = true;
-            }
+            q_cnt += (qt & before).count_ones();
             let nl_pos = i + (nl_bit as usize >> 3);
             if nl_pos > line_start {
-                on_line(&buf[line_start..nl_pos], &commas, c_cnt, has_q);
+                on_line(&buf[line_start..nl_pos], &commas, c_cnt, q_cnt);
             }
             let clear = (!0u64).checked_shl(nl_bit + 1).unwrap_or(0);
             nl &= clear;
@@ -455,7 +484,7 @@ fn scan_slice_scalar<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
             qt &= clear;
             line_start = nl_pos + 1;
             c_cnt = 0;
-            has_q = false;
+            q_cnt = 0;
         }
         while cm != 0 {
             let pos = i + (cm.trailing_zeros() as usize >> 3);
@@ -465,9 +494,7 @@ fn scan_slice_scalar<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
             c_cnt += 1;
             cm &= cm - 1;
         }
-        if qt != 0 {
-            has_q = true;
-        }
+        q_cnt += qt.count_ones();
         i += 8;
     }
 
@@ -475,29 +502,29 @@ fn scan_slice_scalar<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
         let b = unsafe { *buf.get_unchecked(i) };
         if b == b'\n' {
             if i > line_start {
-                on_line(&buf[line_start..i], &commas, c_cnt, has_q);
+                on_line(&buf[line_start..i], &commas, c_cnt, q_cnt);
             }
             line_start = i + 1;
             c_cnt = 0;
-            has_q = false;
+            q_cnt = 0;
         } else if b == b',' {
             if c_cnt < N {
                 commas[c_cnt] = i - line_start;
             }
             c_cnt += 1;
         } else if b == b'"' {
-            has_q = true;
+            q_cnt += 1;
         }
         i += 1;
     }
     if line_start < len {
-        on_line(&buf[line_start..len], &commas, c_cnt, has_q);
+        on_line(&buf[line_start..len], &commas, c_cnt, q_cnt);
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scan_slice_avx2<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
+unsafe fn scan_slice_avx2<const N: usize, F: FnMut(&[u8], &[usize; N], usize, u32)>(
     buf: &[u8],
     mut on_line: F,
 ) {
@@ -511,7 +538,7 @@ unsafe fn scan_slice_avx2<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bo
     let mut line_start = 0usize;
     let mut commas = [0usize; N];
     let mut c_cnt = 0usize;
-    let mut has_q = false;
+    let mut q_cnt = 0u32;
     let mut i = 0usize;
 
     while i + 32 <= len {
@@ -532,12 +559,10 @@ unsafe fn scan_slice_avx2<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bo
                 c_cnt += 1;
                 cm_b &= cm_b - 1;
             }
-            if (qt & before) != 0 {
-                has_q = true;
-            }
+            q_cnt += (qt & before).count_ones();
             let nl_pos = i + (nl_bit as usize);
             if nl_pos > line_start {
-                on_line(&buf[line_start..nl_pos], &commas, c_cnt, has_q);
+                on_line(&buf[line_start..nl_pos], &commas, c_cnt, q_cnt);
             }
             let clear = (!0u32).checked_shl(nl_bit + 1).unwrap_or(0);
             nl &= clear;
@@ -545,7 +570,7 @@ unsafe fn scan_slice_avx2<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bo
             qt &= clear;
             line_start = nl_pos + 1;
             c_cnt = 0;
-            has_q = false;
+            q_cnt = 0;
         }
         while cm != 0 {
             let pos = i + (cm.trailing_zeros() as usize);
@@ -555,9 +580,7 @@ unsafe fn scan_slice_avx2<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bo
             c_cnt += 1;
             cm &= cm - 1;
         }
-        if qt != 0 {
-            has_q = true;
-        }
+        q_cnt += qt.count_ones();
         i += 32;
     }
 
@@ -565,28 +588,28 @@ unsafe fn scan_slice_avx2<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bo
         let b = *buf.get_unchecked(i);
         if b == b'\n' {
             if i > line_start {
-                on_line(&buf[line_start..i], &commas, c_cnt, has_q);
+                on_line(&buf[line_start..i], &commas, c_cnt, q_cnt);
             }
             line_start = i + 1;
             c_cnt = 0;
-            has_q = false;
+            q_cnt = 0;
         } else if b == b',' {
             if c_cnt < N {
                 commas[c_cnt] = i - line_start;
             }
             c_cnt += 1;
         } else if b == b'"' {
-            has_q = true;
+            q_cnt += 1;
         }
         i += 1;
     }
     if line_start < len {
-        on_line(&buf[line_start..len], &commas, c_cnt, has_q);
+        on_line(&buf[line_start..len], &commas, c_cnt, q_cnt);
     }
 }
 
 #[inline(always)]
-fn scan_slice<const N: usize, F: FnMut(&[u8], &[usize; N], usize, bool)>(
+fn scan_slice<const N: usize, F: FnMut(&[u8], &[usize; N], usize, u32)>(
     buf: &[u8],
     use_avx2: bool,
     on_line: F,
@@ -624,6 +647,24 @@ fn find_nl(buf: &[u8], start: usize) -> usize {
 // ============================================================================
 // Fast DateCache (1-entry register hit + 64-entry L1 table) & Timestamp Parsing
 // ============================================================================
+
+/// True iff all 8 bytes of `v` (little-endian load) are ASCII '0'..='9'.
+#[inline(always)]
+fn swar_is_8_digits(v: u64) -> bool {
+    ((v & 0xF0F0_F0F0_F0F0_F0F0)
+        | ((v.wrapping_add(0x0606_0606_0606_0606) & 0xF0F0_F0F0_F0F0_F0F0) >> 4))
+        == 0x3333_3333_3333_3333
+}
+
+/// Value of 8 ASCII digits (first digit in the lowest byte). Input must pass
+/// swar_is_8_digits.
+#[inline(always)]
+fn swar_parse_8_digits(v: u64) -> u64 {
+    let v = v.wrapping_sub(0x3030_3030_3030_3030);
+    let v = v.wrapping_mul(10).wrapping_add(v >> 8);
+    let v = ((v & 0x00FF_00FF_00FF_00FF).wrapping_mul(1 + (100 << 16))) >> 16;
+    ((v & 0x0000_FFFF_0000_FFFF).wrapping_mul(1 + (10_000 << 32))) >> 32
+}
 
 #[inline(always)]
 fn parse_2_digits(a: u8, b: u8) -> Option<i32> {
@@ -751,17 +792,15 @@ impl DateCache {
             return self.parse_datetime_prefix(b);
         }
         if len == 13 {
-            let mut val: i64 = 0;
-            let mut i = 0;
-            while i < 13 {
-                let d = unsafe { b.get_unchecked(i).wrapping_sub(b'0') };
-                if d > 9 {
-                    return None;
-                }
-                val = val * 10 + (d as i64);
-                i += 1;
+            // Two overlapping 8-byte loads cover all 13 bytes; SWAR validate + parse.
+            let a = u64::from_le_bytes(unsafe { *(b.as_ptr() as *const [u8; 8]) });
+            let c = u64::from_le_bytes(unsafe { *(b.as_ptr().add(5) as *const [u8; 8]) });
+            if !swar_is_8_digits(a) || !swar_is_8_digits(c) {
+                return None;
             }
-            return Some(val);
+            let hi = swar_parse_8_digits(a); // digits 0..8
+            let lo = swar_parse_8_digits(c) % 100_000; // digits 8..13
+            return Some((hi * 100_000 + lo) as i64);
         }
         if len == 25
             && (unsafe { *b.get_unchecked(19) } == b'+'
@@ -871,174 +910,232 @@ fn parse_manifest_field(json: &[u8], key: &[u8]) -> String {
 // Linked IDs DSU + Flat u64->u64 Lookup + L2 Bloom Filter
 // ============================================================================
 
+/// One linked (non-root) ID and its person's name, with both hashes stored so a
+/// probe touches one 32-byte slot and never rehashes or reads arena bytes on a
+/// mismatch: [key, key_hash, root, root_hash]. Plain u64 arrays so that
+/// vec![[0; 4]; n] gets zeroed pages from the OS instead of writing every slot.
+/// key == 0 means empty (an ID is never empty, so its Pack64 is never 0).
+type LinkEntry = [u64; 4];
+
+/// Interning slot: [key, (tag << 32) | (node index + 1)]; second word 0 = empty.
+type NodeSlot = [u64; 2];
+
+/// How far ahead the prefetch pipelines run (in items).
+const PF_DIST: usize = 16;
+
+#[inline(always)]
+fn dsu_find(parent: &mut [u32], mut x: u32) -> u32 {
+    let mut root = x;
+    while unsafe { *parent.get_unchecked(root as usize) } != root {
+        root = unsafe { *parent.get_unchecked(root as usize) };
+    }
+    while unsafe { *parent.get_unchecked(x as usize) } != root {
+        let nxt = unsafe { *parent.get_unchecked(x as usize) };
+        unsafe { *parent.get_unchecked_mut(x as usize) = root };
+        x = nxt;
+    }
+    root
+}
+
 struct IdLookup {
     has_links: bool,
     bloom: Vec<u64>,
-    keys: Vec<u64>,
-    vals: Vec<u64>,
+    bloom_mask: usize,
+    entries: Vec<LinkEntry>,
     mask: usize,
 }
 
 impl IdLookup {
+    fn empty() -> Self {
+        Self {
+            has_links: false,
+            bloom: Vec::new(),
+            bloom_mask: 0,
+            entries: Vec::new(),
+            mask: 0,
+        }
+    }
+
+    #[inline(always)]
+    fn bloom_pos(h: u64, m: usize) -> (usize, usize) {
+        ((h as usize) & m, ((h >> 32) as usize) & m)
+    }
+
     fn from_pairs(all_pairs: &[Vec<(u64, u64)>], arenas: &[Vec<u8>]) -> Self {
         let total_pairs: usize = all_pairs.iter().map(|v| v.len()).sum();
         if total_pairs == 0 {
-            return Self {
-                has_links: false,
-                bloom: Vec::new(),
-                keys: Vec::new(),
-                vals: Vec::new(),
-                mask: 0,
-            };
+            return Self::empty();
         }
 
-        let est_nodes = (total_pairs * 2).max(64);
-        let tab_cap = (est_nodes * 2).next_power_of_two().max(64);
-        let mut tab = vec![0u32; tab_cap];
-        let mut tab_mask = tab_cap - 1;
-        let mut node_keys: Vec<u64> = Vec::with_capacity(est_nodes);
-        let mut parent: Vec<u32> = Vec::with_capacity(est_nodes);
-
-        #[inline(always)]
-        fn find(parent: &mut [u32], mut x: u32) -> u32 {
-            let mut root = x;
-            while unsafe { *parent.get_unchecked(root as usize) } != root {
-                root = unsafe { *parent.get_unchecked(root as usize) };
-            }
-            while unsafe { *parent.get_unchecked(x as usize) } != root {
-                let nxt = unsafe { *parent.get_unchecked(x as usize) };
-                unsafe { *parent.get_unchecked_mut(x as usize) = root };
-                x = nxt;
-            }
-            root
-        }
-
-        let mut get_node = |k: u64,
-                            tab: &mut Vec<u32>,
-                            tab_mask: &mut usize,
-                            node_keys: &mut Vec<u64>,
-                            parent: &mut Vec<u32>|
-         -> u32 {
-            if (node_keys.len() + 1) * 10 >= tab.len() * 7 {
-                let nc = tab.len() * 2;
-                *tab = vec![0u32; nc];
-                *tab_mask = nc - 1;
-                for (i, &nk) in node_keys.iter().enumerate() {
-                    let mut p = (hash_pack64(nk, arenas) as usize) & *tab_mask;
-                    while tab[p] != 0 {
-                        p = (p + 1) & *tab_mask;
-                    }
-                    tab[p] = (i as u32) + 1;
-                }
-            }
-            let mut p = (hash_pack64(k, arenas) as usize) & *tab_mask;
-            loop {
-                let e = unsafe { *tab.get_unchecked(p) };
-                if e == 0 {
-                    let idx = node_keys.len() as u32;
-                    node_keys.push(k);
-                    parent.push(idx);
-                    unsafe { *tab.get_unchecked_mut(p) = idx + 1 };
-                    return idx;
-                }
-                let idx = (e - 1) as usize;
-                if eq_pack64(unsafe { *node_keys.get_unchecked(idx) }, k, arenas) {
-                    return idx as u32;
-                }
-                p = (p + 1) & *tab_mask;
-            }
-        };
-
+        // 1) Flatten the endpoints and hash them in one sequential pass (each
+        //    link arena is read in the order it was written).
+        let n_ends = total_pairs * 2;
+        let mut ends: Vec<u64> = Vec::with_capacity(n_ends);
+        let mut end_h: Vec<u64> = Vec::with_capacity(n_ends);
         for pv in all_pairs {
             for &(a, b) in pv {
-                let ia = get_node(a, &mut tab, &mut tab_mask, &mut node_keys, &mut parent);
-                let ib = get_node(b, &mut tab, &mut tab_mask, &mut node_keys, &mut parent);
-                let ra = find(&mut parent, ia);
-                let rb = find(&mut parent, ib);
-                if ra != rb {
-                    if cmp_pack64(node_keys[ra as usize], node_keys[rb as usize], arenas)
-                        == Ordering::Less
-                    {
-                        parent[rb as usize] = ra;
-                    } else {
-                        parent[ra as usize] = rb;
+                ends.push(a);
+                end_h.push(hash_pack64(a, arenas));
+                ends.push(b);
+                end_h.push(hash_pack64(b, arenas));
+            }
+        }
+
+        // 2) Intern endpoints to dense node ids, prefetching the slot of the
+        //    endpoint PF_DIST ahead so the cache misses overlap.
+        let mut cap = n_ends.next_power_of_two().max(64);
+        if n_ends * 4 > cap * 3 {
+            cap *= 2;
+        }
+        let tmask = cap - 1;
+        let mut tab: Vec<NodeSlot> = vec![[0u64; 2]; cap];
+        let mut node_keys: Vec<u64> = Vec::with_capacity(n_ends);
+        let mut node_h: Vec<u64> = Vec::with_capacity(n_ends);
+        let mut ids: Vec<u32> = Vec::with_capacity(n_ends);
+        for i in 0..n_ends {
+            if i + PF_DIST < n_ends {
+                let hp = unsafe { *end_h.get_unchecked(i + PF_DIST) };
+                prefetch(tab.as_ptr().wrapping_add((hp as usize) & tmask));
+            }
+            let k = unsafe { *ends.get_unchecked(i) };
+            let h = unsafe { *end_h.get_unchecked(i) };
+            let tag = h >> 32;
+            let mut p = (h as usize) & tmask;
+            let id = loop {
+                let s = unsafe { *tab.get_unchecked(p) };
+                if s[1] == 0 {
+                    let id = node_keys.len() as u32;
+                    node_keys.push(k);
+                    node_h.push(h);
+                    unsafe {
+                        *tab.get_unchecked_mut(p) = [k, (tag << 32) | (id as u64 + 1)];
                     }
+                    break id;
                 }
-            }
-        }
-
-        let n = node_keys.len();
-        let mut mapped_cnt = 0usize;
-        for i in 0..n {
-            if find(&mut parent, i as u32) != i as u32 {
-                mapped_cnt += 1;
-            }
-        }
-        if mapped_cnt == 0 {
-            return Self {
-                has_links: false,
-                bloom: Vec::new(),
-                keys: Vec::new(),
-                vals: Vec::new(),
-                mask: 0,
+                if (s[1] >> 32) == tag && eq_pack64(s[0], k, arenas) {
+                    break ((s[1] & 0xFFFF_FFFF) - 1) as u32;
+                }
+                p = (p + 1) & tmask;
             };
+            ids.push(id);
+        }
+        std::mem::forget(tab);
+        std::mem::forget(ends);
+        std::mem::forget(end_h);
+
+        // 3) Union by smallest name, as before. Each successful union turns
+        //    exactly one root into a non-root for good, so the union count is
+        //    the number of IDs that need a map entry (no separate counting pass).
+        let n = node_keys.len();
+        let mut parent: Vec<u32> = (0..n as u32).collect();
+        let mut unions = 0usize;
+        for j in 0..total_pairs {
+            if j + PF_DIST < total_pairs {
+                let a = unsafe { *ids.get_unchecked(2 * (j + PF_DIST)) } as usize;
+                let b = unsafe { *ids.get_unchecked(2 * (j + PF_DIST) + 1) } as usize;
+                prefetch(parent.as_ptr().wrapping_add(a));
+                prefetch(parent.as_ptr().wrapping_add(b));
+            }
+            let ia = unsafe { *ids.get_unchecked(2 * j) };
+            let ib = unsafe { *ids.get_unchecked(2 * j + 1) };
+            let ra = dsu_find(&mut parent, ia);
+            let rb = dsu_find(&mut parent, ib);
+            if ra != rb {
+                if cmp_pack64(node_keys[ra as usize], node_keys[rb as usize], arenas)
+                    == Ordering::Less
+                {
+                    parent[rb as usize] = ra;
+                } else {
+                    parent[ra as usize] = rb;
+                }
+                unions += 1;
+            }
+        }
+        std::mem::forget(ids);
+        if unions == 0 {
+            return Self::empty();
         }
 
-        let map_cap = (mapped_cnt * 2).next_power_of_two().max(64);
+        // 4) One 32-byte entry per non-root ID; bloom filter at ~8 bits per
+        //    entry (~3% false positives instead of ~30% with a fixed 256 KB).
+        let map_cap = (unions * 2).next_power_of_two().max(64);
         let mask = map_cap - 1;
-        let mut keys = vec![0u64; map_cap];
-        let mut vals = vec![0u64; map_cap];
-        let mut bloom = vec![0u64; BLOOM_BITS / 64];
-
+        let mut entries: Vec<LinkEntry> = vec![[0u64; 4]; map_cap];
+        let bloom_bits = (unions * 8).next_power_of_two().clamp(1 << 16, 1 << 27);
+        let bloom_mask = bloom_bits - 1;
+        let mut bloom = vec![0u64; bloom_bits / 64];
         for i in 0..n {
-            let r = find(&mut parent, i as u32) as usize;
+            if i + PF_DIST < n {
+                let hp = unsafe { *node_h.get_unchecked(i + PF_DIST) };
+                prefetch(entries.as_ptr().wrapping_add((hp as usize) & mask));
+            }
+            let r = dsu_find(&mut parent, i as u32) as usize;
             if r != i {
-                let k = node_keys[i];
-                let v = node_keys[r];
-                let h = hash_pack64(k, arenas);
-                let b1 = (h as usize) & BLOOM_MASK;
-                let b2 = ((h >> 21) as usize) & BLOOM_MASK;
+                let h = node_h[i];
+                let (b1, b2) = Self::bloom_pos(h, bloom_mask);
                 bloom[b1 >> 6] |= 1u64 << (b1 & 63);
                 bloom[b2 >> 6] |= 1u64 << (b2 & 63);
                 let mut pos = (h as usize) & mask;
-                while keys[pos] != 0 {
+                while entries[pos][0] != 0 {
                     pos = (pos + 1) & mask;
                 }
-                keys[pos] = k;
-                vals[pos] = v;
+                entries[pos] = [node_keys[i], h, node_keys[r], node_h[r]];
             }
         }
+        std::mem::forget(parent);
+        std::mem::forget(node_keys);
+        std::mem::forget(node_h);
 
         Self {
             has_links: true,
             bloom,
-            keys,
-            vals,
+            bloom_mask,
+            entries,
             mask,
         }
     }
 
     #[inline(always)]
-    fn resolve_pack64(&self, p: u64, person_arenas: &[Vec<u8>]) -> (u64, u64) {
-        let h = hash_pack64(p, person_arenas);
+    fn maybe_linked(&self, h: u64) -> bool {
+        let (b1, b2) = Self::bloom_pos(h, self.bloom_mask);
+        unsafe {
+            ((*self.bloom.get_unchecked(b1 >> 6) >> (b1 & 63)) & 1) != 0
+                && ((*self.bloom.get_unchecked(b2 >> 6) >> (b2 & 63)) & 1) != 0
+        }
+    }
+
+    /// Pipeline stage 1 (far ahead): pull in the bloom words.
+    #[inline(always)]
+    fn prefetch_bloom(&self, h: u64) {
         if self.has_links {
-            let b1 = (h as usize) & BLOOM_MASK;
-            if (unsafe { *self.bloom.get_unchecked(b1 >> 6) } & (1u64 << (b1 & 63))) != 0 {
-                let b2 = ((h >> 21) as usize) & BLOOM_MASK;
-                if (unsafe { *self.bloom.get_unchecked(b2 >> 6) } & (1u64 << (b2 & 63))) != 0 {
-                    let mut pos = (h as usize) & self.mask;
-                    loop {
-                        let k = unsafe { *self.keys.get_unchecked(pos) };
-                        if k == 0 {
-                            break;
-                        }
-                        if eq_pack64(k, p, person_arenas) {
-                            let v = unsafe { *self.vals.get_unchecked(pos) };
-                            return (v, hash_pack64(v, person_arenas));
-                        }
-                        pos = (pos + 1) & self.mask;
-                    }
+            let (b1, b2) = Self::bloom_pos(h, self.bloom_mask);
+            prefetch(self.bloom.as_ptr().wrapping_add(b1 >> 6));
+            prefetch(self.bloom.as_ptr().wrapping_add(b2 >> 6));
+        }
+    }
+
+    /// Pipeline stage 2 (nearer): pull in the map slot if the ID may be linked.
+    #[inline(always)]
+    fn prefetch_slot(&self, h: u64) {
+        if self.has_links && self.maybe_linked(h) {
+            prefetch(self.entries.as_ptr().wrapping_add((h as usize) & self.mask));
+        }
+    }
+
+    /// Person name and its hash for a raw user ID whose hash `h` is known.
+    #[inline(always)]
+    fn resolve_hashed(&self, p: u64, h: u64, person_arenas: &[Vec<u8>]) -> (u64, u64) {
+        if self.has_links && self.maybe_linked(h) {
+            let mut pos = (h as usize) & self.mask;
+            loop {
+                let e = unsafe { self.entries.get_unchecked(pos) };
+                if e[0] == 0 {
+                    break;
                 }
+                if e[1] == h && eq_pack64(e[0], p, person_arenas) {
+                    return (e[2], e[3]);
+                }
+                pos = (pos + 1) & self.mask;
             }
         }
         (p, h)
@@ -1433,6 +1530,9 @@ impl<T> SyncCell<T> {
 }
 
 fn main() {
+    // SS_TRACE=1 prints phase timings to stderr (off by default).
+    let t_start = std::time::Instant::now();
+    let trace = std::env::var_os("SS_TRACE").is_some();
     let data_dir = PathBuf::from(std::env::var("DATA_DIR").unwrap_or_else(|_| "/data".into()));
     let out_dir = PathBuf::from(
         std::env::var("OUTPUT_DIR")
@@ -1478,18 +1578,12 @@ fn main() {
         let mf = MappedFile::open(&data_dir.join("products.csv"));
         let b = mf.as_slice();
         let start = find_nl(b, 0);
-        scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, hq| {
+        scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
             if cnt != 1 {
                 return;
             }
-            let (p, cat) = if !hq {
-                (&line[..c[0]], &line[c[0] + 1..])
-            } else {
-                let (Some(p), Some(cat)) = (unquote(&line[..c[0]]), unquote(&line[c[0] + 1..]))
-                else {
-                    return;
-                };
-                (p, cat)
+            let Some([p, cat]) = split_fields::<1, 2>(line, c, q) else {
+                return;
             };
             let idx = match cat_to_idx.get(cat) {
                 Some(i) => i,
@@ -1519,18 +1613,12 @@ fn main() {
         let mf = MappedFile::open(&data_dir.join("campaigns.csv"));
         let b = mf.as_slice();
         let start = find_nl(b, 0);
-        scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, hq| {
+        scan_slice::<1, _>(&b[start..], use_avx2, |line, c, cnt, q| {
             if cnt != 1 {
                 return;
             }
-            let (cp, ch) = if !hq {
-                (&line[..c[0]], &line[c[0] + 1..])
-            } else {
-                let (Some(cp), Some(ch)) = (unquote(&line[..c[0]]), unquote(&line[c[0] + 1..]))
-                else {
-                    return;
-                };
-                (cp, ch)
+            let Some([cp, ch]) = split_fields::<1, 2>(line, c, q) else {
+                return;
             };
             let idx = camp_names.len() as u16;
             camp_names.push(std::str::from_utf8(cp).unwrap().to_owned());
@@ -1556,10 +1644,13 @@ fn main() {
 
     let total_event_bytes: usize = event_files.iter().map(|f| f.len).sum();
     let total_click_bytes: usize = click_files.iter().map(|f| f.len).sum();
-    let est_ev_dedup = ((total_event_bytes / 68) / (ncpu * DEDUP_SHARDS)).max(64);
-    let est_ev_person = ((total_event_bytes / 72) / (ncpu * PERSON_SHARDS)).max(64);
-    let est_cl_dedup = ((total_click_bytes / 45) / (ncpu * DEDUP_SHARDS)).max(32);
-    let est_cl_person = ((total_click_bytes / 48) / (ncpu * PERSON_SHARDS)).max(32);
+    // Reservations get 25% headroom: threads take unequal shares of the chunks,
+    // and an undersized Vec reallocates and copies mid-parse. Untouched capacity
+    // is only virtual memory.
+    let est_ev_dedup = ((total_event_bytes / 68) / (ncpu * DEDUP_SHARDS) * 5 / 4).max(64);
+    let est_ev_person = ((total_event_bytes / 72) / (ncpu * PERSON_SHARDS) * 5 / 4).max(64);
+    let est_cl_dedup = ((total_click_bytes / 45) / (ncpu * DEDUP_SHARDS) * 5 / 4).max(32);
+    let est_cl_person = ((total_click_bytes / 48) / (ncpu * PERSON_SHARDS) * 5 / 4).max(32);
 
     fs::create_dir_all(out_dir.join("user_daily")).unwrap();
     fs::create_dir_all(out_dir.join("campaign_daily")).unwrap();
@@ -1652,19 +1743,12 @@ fn main() {
                         }
                         let (fi, s0, e0) = link_chunks[ci];
                         let slice = &link_files[fi].as_slice()[s0..e0];
-                        scan_slice::<1, _>(slice, use_avx2, |line, c, cnt, hq| {
+                        scan_slice::<1, _>(slice, use_avx2, |line, c, cnt, q| {
                             if cnt != 1 {
                                 return;
                             }
-                            let (a, b) = if !hq {
-                                (&line[..c[0]], &line[c[0] + 1..])
-                            } else {
-                                let (Some(a), Some(b)) =
-                                    (unquote(&line[..c[0]]), unquote(&line[c[0] + 1..]))
-                                else {
-                                    return;
-                                };
-                                (a, b)
+                            let Some([a, b]) = split_fields::<1, 2>(line, c, q) else {
+                                return;
                             };
                             if a.is_empty() || b.is_empty() {
                                 return;
@@ -1679,18 +1763,32 @@ fn main() {
                         link_arena_slots[tid].set(l_arena);
                     }
                     barrier.wait();
+                    if trace && tid == 0 {
+                        eprintln!("[{:7.3} s] links parsed", t_start.elapsed().as_secs_f64());
+                    }
 
                     // ---- WAVE 1B: Thread 0 builds DSU while ALL threads parse events & clicks ----
                     if tid == 0 {
+                        // Move the link arenas out and back instead of cloning them:
+                        // only worker 0 touches link_arena_slots until it takes them
+                        // again (after the next barrier) to build person_arenas.
                         let mut all_pairs = Vec::with_capacity(ncpu);
                         let mut l_arenas = Vec::with_capacity(ncpu);
                         for t in 0..ncpu {
                             all_pairs.push(unsafe { link_pairs_slots[t].take() });
-                            l_arenas.push(unsafe { link_arena_slots[t].get() }.clone());
+                            l_arenas.push(unsafe { link_arena_slots[t].take() });
                         }
                         let lookup = IdLookup::from_pairs(&all_pairs, &l_arenas);
+                        if trace {
+                            eprintln!(
+                                "[{:7.3} s] union-find built on worker 0",
+                                t_start.elapsed().as_secs_f64()
+                            );
+                        }
                         std::mem::forget(all_pairs);
-                        std::mem::forget(l_arenas);
+                        for (t, arena) in l_arenas.into_iter().enumerate() {
+                            unsafe { link_arena_slots[t].set(arena) };
+                        }
                         let _ = id_lookup_cell.set(lookup);
                     }
 
@@ -1710,42 +1808,14 @@ fn main() {
                         }
                         let (fi, s0, e0) = event_chunks[ci];
                         let slice = &event_files[fi].as_slice()[s0..e0];
-                        scan_slice::<6, _>(slice, use_avx2, |line, c, cnt, hq| {
+                        scan_slice::<6, _>(slice, use_avx2, |line, c, cnt, q| {
                             if cnt != 6 {
                                 return;
                             }
-                            let (f1, f2, f3, f4, f5, f6, f7) = if !hq {
-                                (
-                                    &line[..c[0]],
-                                    &line[c[0] + 1..c[1]],
-                                    &line[c[1] + 1..c[2]],
-                                    &line[c[2] + 1..c[3]],
-                                    &line[c[3] + 1..c[4]],
-                                    &line[c[4] + 1..c[5]],
-                                    &line[c[5] + 1..],
-                                )
-                            } else {
-                                let (
-                                    Some(r1),
-                                    Some(r2),
-                                    Some(r3),
-                                    Some(r4),
-                                    Some(r5),
-                                    Some(r6),
-                                    Some(r7),
-                                ) = (
-                                    unquote(&line[..c[0]]),
-                                    unquote(&line[c[0] + 1..c[1]]),
-                                    unquote(&line[c[1] + 1..c[2]]),
-                                    unquote(&line[c[2] + 1..c[3]]),
-                                    unquote(&line[c[3] + 1..c[4]]),
-                                    unquote(&line[c[4] + 1..c[5]]),
-                                    unquote(&line[c[5] + 1..]),
-                                )
-                                else {
-                                    return;
-                                };
-                                (r1, r2, r3, r4, r5, r6, r7)
+                            let Some([f1, f2, f3, f4, f5, f6, f7]) =
+                                split_fields::<6, 7>(line, c, q)
+                            else {
+                                return;
                             };
 
                             if f1.is_empty() {
@@ -1849,28 +1919,12 @@ fn main() {
                         }
                         let (fi, s0, e0) = click_chunks[ci];
                         let slice = &click_files[fi].as_slice()[s0..e0];
-                        scan_slice::<3, _>(slice, use_avx2, |line, c, cnt, hq| {
+                        scan_slice::<3, _>(slice, use_avx2, |line, c, cnt, q| {
                             if cnt != 3 {
                                 return;
                             }
-                            let (f1, f2, f3, f4) = if !hq {
-                                (
-                                    &line[..c[0]],
-                                    &line[c[0] + 1..c[1]],
-                                    &line[c[1] + 1..c[2]],
-                                    &line[c[2] + 1..],
-                                )
-                            } else {
-                                let (Some(r1), Some(r2), Some(r3), Some(r4)) = (
-                                    unquote(&line[..c[0]]),
-                                    unquote(&line[c[0] + 1..c[1]]),
-                                    unquote(&line[c[1] + 1..c[2]]),
-                                    unquote(&line[c[2] + 1..]),
-                                )
-                                else {
-                                    return;
-                                };
-                                (r1, r2, r3, r4)
+                            let Some([f1, f2, f3, f4]) = split_fields::<3, 4>(line, c, q) else {
+                                return;
                             };
                             if f1.is_empty() || f2.is_empty() {
                                 return;
@@ -1942,6 +1996,9 @@ fn main() {
                         let _ = cid_arenas_cell.set(c_arenas);
                     }
                     barrier.wait();
+                    if trace && tid == 0 {
+                        eprintln!("[{:7.3} s] parse done (events + clicks), arenas assembled", t_start.elapsed().as_secs_f64());
+                    }
 
                     // ---- WAVE 2: Dedup events & clicks + resolve IDs + L1-buffered person scatter ----
                     let id_lookup = id_lookup_cell.get().unwrap();
@@ -1956,6 +2013,7 @@ fn main() {
                     let mut tab32: Vec<u32> = Vec::new();
                     let mut tab64: Vec<u64> = Vec::new();
                     let mut unique_ev: Vec<RawEvent> = Vec::new();
+                    let mut uid_h: Vec<u64> = Vec::new();
 
                     loop {
                         let sh = next_dedup_ev.fetch_add(1, AtomicOrd::Relaxed);
@@ -1972,16 +2030,17 @@ fn main() {
                         let cap = ((n * 3) / 2 + 16).next_power_of_two().max(64);
                         let mask = cap - 1;
                         unique_ev.clear();
-                        if unique_ev.capacity() < n {
-                            unique_ev.reserve(n - unique_ev.capacity());
-                        }
+                        unique_ev.reserve(n);
 
                         if n < 1_000_000 {
                             tab32.clear();
                             tab32.resize(cap, 0);
                             for t in 0..ncpu {
                                 let slice = &unsafe { raw_ev_slots[t].get() }[sh];
-                                for &ev in slice {
+                                for (j, &ev) in slice.iter().enumerate() {
+                                    if let Some(nx) = slice.get(j + PF_DIST) {
+                                        prefetch_pack64(nx.eid, eid_arenas);
+                                    }
                                     let h = hash_pack64(ev.eid, eid_arenas);
                                     let tag = ((h >> 24) as u32) & 0xFFF;
                                     let mut pos = (h as usize) & mask;
@@ -2015,7 +2074,10 @@ fn main() {
                             tab64.resize(cap, 0);
                             for t in 0..ncpu {
                                 let slice = &unsafe { raw_ev_slots[t].get() }[sh];
-                                for &ev in slice {
+                                for (j, &ev) in slice.iter().enumerate() {
+                                    if let Some(nx) = slice.get(j + PF_DIST) {
+                                        prefetch_pack64(nx.eid, eid_arenas);
+                                    }
                                     let h = hash_pack64(ev.eid, eid_arenas);
                                     let tag = (h >> 24) as u32;
                                     let mut pos = (h as usize) & mask;
@@ -2044,10 +2106,41 @@ fn main() {
                             }
                         }
 
-                        for ev in &unique_ev {
+                        // Hash every surviving user ID first (prefetching the bytes of
+                        // long IDs), then resolve with a two-stage prefetch: bloom words
+                        // PF_DIST ahead, the map slot PF_DIST/2 ahead.
+                        let nu = unique_ev.len();
+                        uid_h.clear();
+                        uid_h.reserve(nu);
+                        for j in 0..nu {
+                            if j + PF_DIST < nu {
+                                let nx = unsafe { unique_ev.get_unchecked(j + PF_DIST) };
+                                if nx.ts_off != u32::MAX {
+                                    prefetch_pack64(nx.raw_uid, person_arenas);
+                                }
+                            }
+                            let ev = unsafe { unique_ev.get_unchecked(j) };
+                            uid_h.push(if ev.ts_off != u32::MAX {
+                                hash_pack64(ev.raw_uid, person_arenas)
+                            } else {
+                                0
+                            });
+                        }
+                        for j in 0..nu {
+                            if j + PF_DIST < nu {
+                                id_lookup.prefetch_bloom(unsafe { *uid_h.get_unchecked(j + PF_DIST) });
+                            }
+                            if j + PF_DIST / 2 < nu {
+                                id_lookup
+                                    .prefetch_slot(unsafe { *uid_h.get_unchecked(j + PF_DIST / 2) });
+                            }
+                            let ev = unsafe { unique_ev.get_unchecked(j) };
                             if ev.ts_off != u32::MAX {
-                                let (person, ph) =
-                                    id_lookup.resolve_pack64(ev.raw_uid, person_arenas);
+                                let (person, ph) = id_lookup.resolve_hashed(
+                                    ev.raw_uid,
+                                    unsafe { *uid_h.get_unchecked(j) },
+                                    person_arenas,
+                                );
                                 ev_p_writer.push(
                                     (ph >> 58) as usize,
                                     ValidEvent {
@@ -2081,16 +2174,17 @@ fn main() {
                         let cap = ((n * 3) / 2 + 16).next_power_of_two().max(64);
                         let mask = cap - 1;
                         unique_cl.clear();
-                        if unique_cl.capacity() < n {
-                            unique_cl.reserve(n - unique_cl.capacity());
-                        }
+                        unique_cl.reserve(n);
 
                         if n < 1_000_000 {
                             tab32.clear();
                             tab32.resize(cap, 0);
                             for t in 0..ncpu {
                                 let slice = &unsafe { raw_cl_slots[t].get() }[sh];
-                                for &cl in slice {
+                                for (j, &cl) in slice.iter().enumerate() {
+                                    if let Some(nx) = slice.get(j + PF_DIST) {
+                                        prefetch_pack64(nx.cid, cid_arenas);
+                                    }
                                     let h = hash_pack64(cl.cid, cid_arenas);
                                     let tag = ((h >> 24) as u32) & 0xFFF;
                                     let mut pos = (h as usize) & mask;
@@ -2121,7 +2215,10 @@ fn main() {
                             tab64.resize(cap, 0);
                             for t in 0..ncpu {
                                 let slice = &unsafe { raw_cl_slots[t].get() }[sh];
-                                for &cl in slice {
+                                for (j, &cl) in slice.iter().enumerate() {
+                                    if let Some(nx) = slice.get(j + PF_DIST) {
+                                        prefetch_pack64(nx.cid, cid_arenas);
+                                    }
                                     let h = hash_pack64(cl.cid, cid_arenas);
                                     let tag = (h >> 24) as u32;
                                     let mut pos = (h as usize) & mask;
@@ -2146,9 +2243,35 @@ fn main() {
                             }
                         }
 
-                        for cl in &unique_cl {
-                            let (person, ph) =
-                                id_lookup.resolve_pack64(cl.raw_uid, person_arenas);
+                        let nu = unique_cl.len();
+                        uid_h.clear();
+                        uid_h.reserve(nu);
+                        for j in 0..nu {
+                            if j + PF_DIST < nu {
+                                prefetch_pack64(
+                                    unsafe { unique_cl.get_unchecked(j + PF_DIST) }.raw_uid,
+                                    person_arenas,
+                                );
+                            }
+                            uid_h.push(hash_pack64(
+                                unsafe { unique_cl.get_unchecked(j) }.raw_uid,
+                                person_arenas,
+                            ));
+                        }
+                        for j in 0..nu {
+                            if j + PF_DIST < nu {
+                                id_lookup.prefetch_bloom(unsafe { *uid_h.get_unchecked(j + PF_DIST) });
+                            }
+                            if j + PF_DIST / 2 < nu {
+                                id_lookup
+                                    .prefetch_slot(unsafe { *uid_h.get_unchecked(j + PF_DIST / 2) });
+                            }
+                            let cl = unsafe { unique_cl.get_unchecked(j) };
+                            let (person, ph) = id_lookup.resolve_hashed(
+                                cl.raw_uid,
+                                unsafe { *uid_h.get_unchecked(j) },
+                                person_arenas,
+                            );
                             cl_p_writer.push(
                                 (ph >> 58) as usize,
                                 ValidClick {
@@ -2165,6 +2288,7 @@ fn main() {
                     std::mem::forget(unique_cl);
                     std::mem::forget(tab32);
                     std::mem::forget(tab64);
+                    std::mem::forget(uid_h);
 
                     unsafe {
                         ev_person_slots[tid].set(ev_p_writer.finish());
@@ -2186,6 +2310,9 @@ fn main() {
                         let _ = shard_order_cell.set(order);
                     }
                     barrier.wait();
+                    if trace && tid == 0 {
+                        eprintln!("[{:7.3} s] wave 2 done (dedup + resolve); shard order ready", t_start.elapsed().as_secs_f64());
+                    }
 
                     // ---- WAVE 3: Group-by-person, sessionize, stream directly to Parquet ----
                     let shard_order = shard_order_cell.get().unwrap();
@@ -2243,7 +2370,10 @@ fn main() {
 
                         for t in 0..ncpu {
                             let slice = &unsafe { ev_person_slots[t].get() }[ps];
-                            for &ev in slice {
+                            for (j, &ev) in slice.iter().enumerate() {
+                                if let Some(nx) = slice.get(j + PF_DIST) {
+                                    prefetch_pack64(nx.person, person_arenas);
+                                }
                                 if (person_keys.len() + 1) * 10 >= pid_tab.len() * 7 {
                                     let nc = pid_tab.len() * 2;
                                     pid_tab.clear();
@@ -2326,7 +2456,10 @@ fn main() {
                         matched_cl.clear();
                         for t in 0..ncpu {
                             let slice = &unsafe { cl_person_slots[t].get() }[ps];
-                            for &cl in slice {
+                            for (j, &cl) in slice.iter().enumerate() {
+                                if let Some(nx) = slice.get(j + PF_DIST) {
+                                    prefetch_pack64(nx.person, person_arenas);
+                                }
                                 let h = hash_pack64(cl.person, person_arenas);
                                 let mut pos = (h as usize) & mask;
                                 loop {
@@ -2737,5 +2870,8 @@ fn main() {
         &camp_cols,
     );
 
+    if trace {
+        eprintln!("[{:7.3} s] all output written", t_start.elapsed().as_secs_f64());
+    }
     std::process::exit(0);
 }
